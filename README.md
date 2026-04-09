@@ -88,8 +88,9 @@ pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
 - v0.1: Literature 폴더 Deep-Research 모드 (단일 폴더)
 - v0.1.1: Multi-hop reasoning 루프 (ToC Review → Select → Evaluate → Final)
 - v0.1.2: PageIndex 실제 통합 — LONG 노트의 섹션 트리 빌드 + 디스크 캐시 + 섹션 단위 descend
-- **v0.1.3 (현재)**: h1-title flatten 최적화 + `(intro)` 보존 / vault-relative section id (collision fix) / Ollama smoke test 스크립트 + real-vault 벤치마크 harness + `docs/BENCHMARKING.md`
-- **v0.2**: 복수 폴더 + `[[wiki-link]]` cross-reference
+- v0.1.3: h1-title flatten 최적화 + `(intro)` 보존 / vault-relative section id (collision fix) / Ollama smoke test 스크립트 + real-vault 벤치마크 harness + `docs/BENCHMARKING.md`
+- **v0.1.4 (현재)**: `[[wiki-link]]` resolution index + `scan --show-graph` 플래그 (v0.2 단계 1 — retrieval은 아직 손대지 않음)
+- **v0.2**: wiki-link **traversal** — 멀티홉 retrieval 루프가 outgoing link를 따라감
 - **v0.3**: Karpathy LLM-Wiki compiler 통합
 - **v0.4**: 증분 재인덱싱 + 파일 watcher
 - **v0.5**: Obsidian 플러그인 UI
