@@ -17,6 +17,8 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 
+from .cache import TreeCache
+from .pageindex_adapter import build_long_note_subtree
 from .prompts import atomic_summary_prompt
 from .tree import NoteTier, TreeNode
 
@@ -153,3 +155,64 @@ def summarize_atomic_notes(
         calls += 1
 
     return calls
+
+
+def build_long_subtrees(
+    root: TreeNode,
+    *,
+    vault_root: Path,
+    model_id: str,
+    chat_fn: ChatFn | None = None,
+    cache: TreeCache | None = None,
+) -> tuple[int, int]:
+    """Populate ``children`` for every LONG note under ``root``.
+
+    Walks the Layer 1 tree, finds notes tagged ``tier == LONG``, and
+    delegates to ``pageindex_adapter.build_long_note_subtree`` to build
+    the PageIndex-style section hierarchy. Results are cached on disk
+    via ``TreeCache`` so repeat scans are near-instant.
+
+    Args:
+        root: Layer 1 tree root from ``scan_folder``.
+        vault_root: Absolute path to the Obsidian vault. Used as the
+            base for the ``.pagewiki-cache/`` directory.
+        model_id: LLM model identifier (e.g. ``ollama/gemma4:26b``).
+            Part of the cache key so cached trees built by a different
+            model are automatically rejected.
+        chat_fn: Optional LLM callable for generating per-section
+            summaries. When ``None``, sections fall back to truncated
+            body text (faster, worse ToC review quality).
+        cache: Optional pre-constructed cache. If omitted, a new one
+            rooted at ``vault_root`` is created.
+
+    Returns:
+        ``(built, from_cache)`` — the count of LONG notes processed
+        fresh vs. served from the cache.
+    """
+    if cache is None:
+        cache = TreeCache(vault_root)
+
+    built = 0
+    from_cache = 0
+
+    for node in root.walk():
+        if node.kind != "note" or node.tier != NoteTier.LONG:
+            continue
+        if node.file_path is None:
+            continue
+
+        def _build() -> list[TreeNode]:
+            return build_long_note_subtree(
+                node.file_path,  # type: ignore[arg-type]
+                node.title,
+                chat_fn=chat_fn,
+            )
+
+        children, hit = cache.load_or_build(node.file_path, model_id, _build)
+        node.children = children
+        if hit:
+            from_cache += 1
+        else:
+            built += 1
+
+    return built, from_cache

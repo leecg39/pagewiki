@@ -144,22 +144,39 @@ pagewiki/
 
 | 패키지 | 역할 | 라이선스 |
 |---|---|---|
-| `pageindex` | Layer 2 엔진 | MIT |
 | `litellm` | LLM 라우터 (Ollama 포함) | MIT |
 | `pydantic` | TreeNode 검증 | MIT |
 | `click` | CLI | BSD-3 |
 | `rich` | 터미널 출력 | MIT |
 
+**Vendored (직접 번들):**
+| 모듈 | 역할 | 라이선스 |
+|---|---|---|
+| `_vendor/pageindex/` | Layer 2 마크다운 트리 빌더 (VectifyAI/PageIndex `@f2dcffc`) | MIT |
+
+v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pageindex/`에
+최소 범위(마크다운 전용, LLM 호출 제거)로 번들된다. 이유:
+1. 공식 `pageindex` 패키지는 `PyPDF2`/`pymupdf`/`litellm`을 강제로 끌어오며,
+   pagewiki의 Obsidian-markdown-only 파이프라인에는 PDF 의존성이 불필요하다.
+2. 업스트림의 LLM 호출 경로(`md_to_tree`)는 `.env` 기반 OpenAI 키를 가정한다.
+   pagewiki는 `chat_fn` DI로 Ollama 경유 Gemma 4만 사용하므로 자체 어댑터에서
+   요약을 생성한다.
+
 **런타임 외부 의존**:
 - Ollama (`brew install ollama`)
-- `gemma4:26b` 또는 `gemma4:e4b` 모델
+- `gemma4:26b` (64GB RAM Mac 기준 기본), `gemma4:e4b` (16GB 폴백)
+
+**Layer 2 캐시**: `{vault}/.pagewiki-cache/trees/{sha1}.json`. 캐시 키는
+`(abs_path, mtime_ns, model_id, adapter_version)` 4요소이며 하나라도
+바뀌면 재빌드된다. `rm -rf .pagewiki-cache` 안전 (idempotent).
 
 ## 7. 로드맵
 
 | 버전 | 범위 |
 |---|---|
-| **v0.1** (현재) | 스캐폴딩, Layer 1 스캐너, 3-tier 분류, CLI 구조 |
+| v0.1 | 스캐폴딩, Layer 1 스캐너, 3-tier 분류, CLI 구조 |
 | v0.1.1 | Multi-hop reasoning 루프 구현, ask 명령 완성 |
+| **v0.1.2** (현재) | PageIndex SDK 실제 통합 (vendored), Layer 2 섹션 트리, 디스크 캐시, 섹션 단위 retrieval descend |
 | v0.2 | `[[wiki-link]]` cross-reference 탐색 |
 | v0.3 | Karpathy LLM-Wiki compiler (entity 추출 → `LLM-Wiki/` 폴더) |
 | v0.4 | 증분 재인덱싱 + mtime 기반 watcher |

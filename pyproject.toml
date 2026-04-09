@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pagewiki"
-version = "0.1.0"
+version = "0.1.2"
 description = "Vectorless reasoning-based RAG for Obsidian vaults, powered by local Gemma 4"
 readme = "README.md"
 license = { text = "MIT" }
@@ -25,9 +25,12 @@ dependencies = [
   "click>=8.1.0",
   "pydantic>=2.5.0",
   "litellm>=1.40.0",
-  "pageindex>=0.1.0",
   "rich>=13.7.0",
 ]
+# NOTE: the PageIndex tree-building algorithm is vendored under
+# src/pagewiki/_vendor/pageindex/ (MIT, from VectifyAI/PageIndex).
+# pip-installing `pageindex` would pull in PyPDF2 + pymupdf, neither
+# of which pagewiki needs for markdown-only vaults.
 
 [project.optional-dependencies]
 dev = [

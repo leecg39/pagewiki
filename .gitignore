@@ -28,6 +28,7 @@ htmlcov/
 
 # pagewiki runtime
 .pagewiki-log/
+.pagewiki-cache/
 *.tree.json
 .env
 .env.local

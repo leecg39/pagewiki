@@ -40,7 +40,11 @@ class TreeNode(BaseModel):
     wiki_links: list[str] = Field(default_factory=list)
 
     # PageIndex-compatible (Layer 2)
+    # For PDF sources: (start_page, end_page). Unused in markdown mode.
     page_range: tuple[int, int] | None = None
+    # For markdown sources: (start_line_1indexed, end_line_exclusive).
+    # Populated by pageindex_adapter when splitting LONG notes into sections.
+    line_range: tuple[int, int] | None = None
 
     # Recursive children
     children: list[TreeNode] = Field(default_factory=list)

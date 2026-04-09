@@ -16,10 +16,11 @@ from rich.console import Console
 from rich.table import Table
 
 from . import __version__
+from .cache import TreeCache
 from .logger import QueryRecord, write_log
 from .retrieval import run_retrieval
 from .tree import NoteTier
-from .vault import scan_folder, summarize_atomic_notes
+from .vault import build_long_subtrees, scan_folder, summarize_atomic_notes
 
 console = Console()
 
@@ -53,7 +54,17 @@ def main() -> None:
 @click.option(
     "--folder", default=None, help="Subfolder inside the vault (e.g. Research)."
 )
-def scan(vault: Path, folder: str | None) -> None:
+@click.option(
+    "--build-long",
+    is_flag=True,
+    help="Eagerly build PageIndex sub-trees for every LONG note (no LLM; uses cache).",
+)
+@click.option(
+    "--model",
+    default="ollama/gemma4:26b",
+    help="Model id used as part of the cache key for --build-long.",
+)
+def scan(vault: Path, folder: str | None, build_long: bool, model: str) -> None:
     """Scan a vault folder and report 3-tier classification counts."""
     console.print(f"[bold cyan]Scanning[/] {vault}{('/' + folder) if folder else ''}")
     root = scan_folder(vault, folder)
@@ -79,6 +90,20 @@ def scan(vault: Path, folder: str | None) -> None:
 
     console.print(table)
     console.print(f"Estimated total tokens: [yellow]{total_tokens:,}[/]")
+
+    if build_long and counts[NoteTier.LONG] > 0:
+        console.print(
+            f"\n[dim]Building PageIndex sub-trees for {counts[NoteTier.LONG]} LONG notes...[/]"
+        )
+        built, from_cache = build_long_subtrees(
+            root,
+            vault_root=vault,
+            model_id=model,
+            chat_fn=None,  # scan command never calls the LLM
+        )
+        console.print(
+            f"[dim]    → {built} built, {from_cache} from cache[/]"
+        )
 
 
 @main.command()
@@ -118,9 +143,12 @@ def ask(
     chat_fn = _make_chat_fn(model, num_ctx)
 
     # Step 1: scan
-    console.print("[dim]1/3 Scanning vault...[/]")
+    console.print("[dim]1/4 Scanning vault...[/]")
     root = scan_folder(vault, folder)
     note_count = sum(1 for n in root.walk() if n.kind == "note")
+    long_count = sum(
+        1 for n in root.walk() if n.kind == "note" and n.tier == NoteTier.LONG
+    )
 
     if note_count == 0:
         console.print(f"[red]No notes found in {vault / folder}[/]")
@@ -128,14 +156,31 @@ def ask(
 
     # Step 2: summarize atomic notes (optional)
     if not skip_summaries:
-        console.print("[dim]2/3 Summarizing atomic notes...[/]")
+        console.print("[dim]2/4 Summarizing atomic notes...[/]")
         summarized = summarize_atomic_notes(root, chat_fn)
         console.print(f"[dim]    → {summarized} notes summarized[/]")
     else:
-        console.print("[dim]2/3 Skipping summarization (--skip-summaries)[/]")
+        console.print("[dim]2/4 Skipping summarization (--skip-summaries)[/]")
 
-    # Step 3: retrieval loop
-    console.print("[dim]3/3 Running multi-hop retrieval loop...[/]\n")
+    # Step 3: build Layer 2 sub-trees for LONG notes (cached)
+    if long_count > 0:
+        console.print(
+            f"[dim]3/4 Building PageIndex sub-trees for {long_count} LONG notes...[/]"
+        )
+        section_chat_fn = None if skip_summaries else chat_fn
+        built, from_cache = build_long_subtrees(
+            root,
+            vault_root=vault,
+            model_id=model,
+            chat_fn=section_chat_fn,
+            cache=TreeCache(vault),
+        )
+        console.print(f"[dim]    → {built} built, {from_cache} from cache[/]")
+    else:
+        console.print("[dim]3/4 No LONG notes — skipping sub-tree build[/]")
+
+    # Step 4: retrieval loop
+    console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
     result = run_retrieval(query, root, chat_fn)
 
     elapsed = time.time() - start

@@ -192,3 +192,25 @@ def atomic_summary_prompt(title: str, content: str) -> str:
         f"[제목] {title}\n\n"
         f"[본문]\n{content[:4000]}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Long-note section summarization (PageIndex sub-tree nodes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def section_summary_prompt(note_title: str, section_title: str, section_text: str) -> str:
+    """One-line Korean summary prompt for a single section of a long note.
+
+    Used by the Layer 2 adapter when generating summaries for PageIndex
+    sub-tree nodes so the retrieval loop can do ToC review at the section
+    level.
+    """
+    return (
+        "다음은 한 연구 노트의 한 섹션입니다. "
+        "이 섹션의 핵심 주제를 한국어 한 문장(80자 이내)으로 요약하세요. "
+        "문장 외 다른 텍스트는 출력하지 마세요.\n\n"
+        f"[노트 제목] {note_title}\n"
+        f"[섹션 제목] {section_title}\n\n"
+        f"[섹션 본문]\n{section_text[:4000]}"
+    )

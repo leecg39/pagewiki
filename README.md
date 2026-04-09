@@ -63,21 +63,31 @@ pip install -e .
 ## 사용법
 
 ```bash
-# 단일 폴더에 대해 질의 (MVP v0.1)
+# 단일 폴더에 대해 질의
 pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
   --vault ~/Documents/Obsidian \
   --folder Research \
-  --model gemma4:26b
+  --model ollama/gemma4:26b
 ```
+
+파이프라인은 4단계로 구성됩니다 (v0.1.2):
+
+1. **Scan** — 볼트 walking + 3-tier 분류 (MICRO/ATOMIC/LONG)
+2. **Summarize atomic** — ATOMIC 노트에 한 줄 요약
+3. **Build long sub-trees** — LONG 노트마다 PageIndex 섹션 트리 생성 (캐시됨)
+4. **Multi-hop retrieval** — ToC Review → Select → Descend → Evaluate → Final Answer
 
 출력:
 - 답변 (stdout)
-- 인용된 노드 경로 (page_range, section path)
-- `{vault}/Research/.pagewiki-log/{timestamp}.md`에 자동 기록
+- 인용된 노드 경로 (파일명 + 섹션 id, 예: `paper.md#0003`)
+- `{vault}/Research/.pagewiki-log/{timestamp}.md` 감사 로그
+- Layer 2 캐시: `{vault}/.pagewiki-cache/trees/` (자동 invalidate)
 
 ## 로드맵
 
-- **v0.1** (현재): Literature 폴더 Deep-Research 모드 (단일 폴더)
+- v0.1: Literature 폴더 Deep-Research 모드 (단일 폴더)
+- v0.1.1: Multi-hop reasoning 루프 (ToC Review → Select → Evaluate → Final)
+- **v0.1.2 (현재)**: PageIndex 실제 통합 — LONG 노트의 섹션 트리 빌드 + 디스크 캐시 + 섹션 단위 descend
 - **v0.2**: 복수 폴더 + `[[wiki-link]]` cross-reference
 - **v0.3**: Karpathy LLM-Wiki compiler 통합
 - **v0.4**: 증분 재인덱싱 + 파일 watcher
@@ -92,6 +102,10 @@ pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
 ## 라이선스
 
 MIT. [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex)도 MIT.
+
+`src/pagewiki/_vendor/pageindex/`에 PageIndex 마크다운 트리 빌더의
+최소 부분이 번들되어 있습니다 (MIT, commit `f2dcffc`).
+LICENSE 사본은 해당 디렉터리에 그대로 보존되어 있습니다.
 
 ## Credits
 
