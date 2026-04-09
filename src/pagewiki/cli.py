@@ -13,6 +13,7 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import __version__
@@ -37,6 +38,21 @@ def _make_chat_fn(model: str, num_ctx: int):
         return chat(prompt, model=model, num_ctx=num_ctx).text
 
     return _call
+
+
+def _format_dangling_line(source_id: str, raw_target: str) -> str:
+    """Format one dangling-link line for Rich console rendering.
+
+    Both ``source_id`` and ``raw_target`` come from user vault data
+    (file paths and wiki-link targets), so they may contain characters
+    that Rich parses as markup — most notably square brackets, which
+    turn ``[[raw_target]]`` into a vanishing style tag. We escape both
+    fields before splicing them into the final markup string so the
+    original text is preserved verbatim.
+    """
+    safe_source = escape(source_id)
+    safe_target = escape(raw_target)
+    return f"  [yellow]{safe_source}[/] → \\[\\[{safe_target}]]"
 
 
 @click.group()
@@ -152,7 +168,7 @@ def scan(
                 f"\n[bold yellow]Dangling links ({stats.dangling_count}):[/]"
             )
             for source_id, raw_target in index.dangling()[:10]:
-                console.print(f"  [yellow]{source_id}[/] → [[{raw_target}]]")
+                console.print(_format_dangling_line(source_id, raw_target))
             if stats.dangling_count > 10:
                 console.print(
                     f"  [dim]… and {stats.dangling_count - 10} more[/]"
