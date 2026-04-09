@@ -39,13 +39,20 @@ def _scripted_chat(responses: list[str]) -> Callable[[str], str]:
 
 @pytest.fixture
 def vault_with_sectioned_note(tmp_path: Path) -> tuple[Path, TreeNode]:
-    """Build a vault whose single LONG note has a populated sub-tree."""
+    """Build a vault whose single LONG note has a populated sub-tree.
+
+    The filename ``notes.md`` deliberately does NOT match the h1
+    ``# Paper``, so the v0.1.3 h1-flatten optimization stays dormant
+    and these tests keep exercising the full multi-level descend path
+    (folder → note → root section → leaf section). Flattened-tree
+    behavior has its own test class.
+    """
     vault = tmp_path / "vault"
     research = vault / "Research"
     research.mkdir(parents=True)
 
     body_filler = "Lorem ipsum dolor sit amet. " * 200
-    note = research / "paper.md"
+    note = research / "notes.md"
     note.write_text(
         "# Paper\n\n"
         f"Opening paragraph. {body_filler}\n\n"
@@ -57,12 +64,14 @@ def vault_with_sectioned_note(tmp_path: Path) -> tuple[Path, TreeNode]:
     )
 
     root = scan_folder(vault, "Research")
-    # Inject the sub-tree directly (skipping the cache for test isolation)
+    # Inject the sub-tree directly (skipping the cache for test isolation).
+    # We pass note.stem ("notes") as note_title so _extract_intro_from_root
+    # sees the title mismatch and leaves the root section intact.
     long_nodes = [
         n for n in root.walk() if n.kind == "note" and n.tier == NoteTier.LONG
     ]
     assert len(long_nodes) == 1
-    long_nodes[0].children = build_long_note_subtree(note, "Paper", chat_fn=None)
+    long_nodes[0].children = build_long_note_subtree(note, "notes", chat_fn=None)
 
     return vault, root
 
@@ -142,3 +151,104 @@ class TestRetrievalSectionDescend:
         assert strict_subset_count >= 1, (
             "at least one child section must load strictly less than the whole file"
         )
+
+
+class TestRetrievalWithFlattenedTree:
+    """With v0.1.3 h1-flatten, a matching-title note loses one level
+    of descent — retrieval goes folder → note → leaf section directly,
+    skipping the redundant root section that wrapped the whole file."""
+
+    @pytest.fixture
+    def flattened_vault(self, tmp_path: Path) -> tuple[Path, TreeNode]:
+        vault = tmp_path / "vault"
+        research = vault / "Research"
+        research.mkdir(parents=True)
+        # Filename matches the h1 title → flatten kicks in.
+        body_filler = "Lorem ipsum dolor sit amet. " * 200
+        (research / "paper.md").write_text(
+            "# Paper\n\n"
+            f"Abstract content we want preserved as (intro). {body_filler}\n\n"
+            "## Methods\n\n"
+            f"Methods body. {body_filler}\n\n"
+            "## Results\n\n"
+            f"Results body. {body_filler}\n",
+            encoding="utf-8",
+        )
+
+        root = scan_folder(vault, "Research")
+        from pagewiki.vault import build_long_subtrees
+
+        build_long_subtrees(
+            root,
+            vault_root=vault,
+            model_id="ollama/gemma4:26b",
+            chat_fn=None,
+        )
+        return vault, root
+
+    def test_flattened_note_children_have_no_paper_wrapper(
+        self, flattened_vault: tuple[Path, TreeNode]
+    ) -> None:
+        _, root = flattened_vault
+        long_note = next(
+            n for n in root.walk() if n.kind == "note" and n.tier == NoteTier.LONG
+        )
+        child_titles = [c.title for c in long_note.children]
+        # The "Paper" h1 wrapper should be gone; (intro) + h2 sections
+        # should be promoted to the top level directly.
+        assert "Paper" not in child_titles
+        assert "(intro)" in child_titles
+        assert "Methods" in child_titles
+        assert "Results" in child_titles
+
+    def test_flattened_note_needs_one_fewer_select(
+        self, flattened_vault: tuple[Path, TreeNode]
+    ) -> None:
+        _, root = flattened_vault
+        long_note = next(
+            n for n in root.walk() if n.kind == "note" and n.tier == NoteTier.LONG
+        )
+        methods = next(c for c in long_note.children if c.title == "Methods")
+
+        # Descend path is now: folder → note → leaf section. Three
+        # SELECTs instead of four.
+        responses = [
+            f"SELECT: {long_note.node_id}",   # Research folder → note
+            f"SELECT: {methods.node_id}",     # note → Methods directly
+            "SUFFICIENT: found methods",
+            "최종 답변입니다.",
+        ]
+        result = run_retrieval(
+            "what methods did they use?", root, _scripted_chat(responses)
+        )
+        assert methods.node_id in result.cited_nodes
+
+    def test_flattened_intro_section_is_reachable(
+        self, flattened_vault: tuple[Path, TreeNode]
+    ) -> None:
+        """The synthetic (intro) section must be a first-class
+        retrieval target — selectable, loadable, and its loaded content
+        must contain the abstract without any subsequent section body."""
+        from pagewiki.retrieval import _load_note_content
+
+        _, root = flattened_vault
+        long_note = next(
+            n for n in root.walk() if n.kind == "note" and n.tier == NoteTier.LONG
+        )
+        intro = next(c for c in long_note.children if c.title == "(intro)")
+
+        responses = [
+            f"SELECT: {long_note.node_id}",
+            f"SELECT: {intro.node_id}",
+            "SUFFICIENT: abstract found",
+            "요약된 답변.",
+        ]
+        result = run_retrieval(
+            "what does the abstract say?", root, _scripted_chat(responses)
+        )
+        assert intro.node_id in result.cited_nodes
+
+        intro_content = _load_note_content(intro)
+        assert "Abstract content" in intro_content
+        assert "Methods body." not in intro_content
+        assert "Results body." not in intro_content
