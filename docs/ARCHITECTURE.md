@@ -176,7 +176,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 |---|---|
 | v0.1 | 스캐폴딩, Layer 1 스캐너, 3-tier 분류, CLI 구조 |
 | v0.1.1 | Multi-hop reasoning 루프 구현, ask 명령 완성 |
-| **v0.1.2** (현재) | PageIndex SDK 실제 통합 (vendored), Layer 2 섹션 트리, 디스크 캐시, 섹션 단위 retrieval descend |
+| v0.1.2 | PageIndex SDK 실제 통합 (vendored), Layer 2 섹션 트리, 디스크 캐시, 섹션 단위 retrieval descend |
+| **v0.1.3** (현재) | h1-title flatten + `(intro)` 보존, vault-relative section id (PR #1 review fix), `scripts/ollama_smoke.py`, `scripts/benchmark_vault.py`, `docs/BENCHMARKING.md` |
 | v0.2 | `[[wiki-link]]` cross-reference 탐색 |
 | v0.3 | Karpathy LLM-Wiki compiler (entity 추출 → `LLM-Wiki/` 폴더) |
 | v0.4 | 증분 재인덱싱 + mtime 기반 watcher |

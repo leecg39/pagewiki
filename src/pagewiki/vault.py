@@ -201,11 +201,21 @@ def build_long_subtrees(
         if node.file_path is None:
             continue
 
+        # ``node.node_id`` is already the vault-relative path (assigned
+        # by ``_note_to_node``), so reuse it directly as the section
+        # prefix. This guarantees ``Research/paper.md#0002`` and
+        # ``Archive/paper.md#0002`` stay distinct in the retrieval
+        # ``visited_ids`` set. Fixes PR #1 review comment (v0.1.3).
+        node_path = node.file_path
+        node_title = node.title
+        node_prefix = node.node_id
+
         def _build() -> list[TreeNode]:
             return build_long_note_subtree(
-                node.file_path,  # type: ignore[arg-type]
-                node.title,
+                node_path,
+                node_title,
                 chat_fn=chat_fn,
+                node_id_prefix=node_prefix,
             )
 
         children, hit = cache.load_or_build(node.file_path, model_id, _build)

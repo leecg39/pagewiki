@@ -127,3 +127,171 @@ class TestBuildLongNoteSubtree:
                 assert not node.summary.lstrip().startswith("#"), (
                     f"summary should not start with a markdown heading: {node.summary!r}"
                 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.1.3: h1-title flatten optimization
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestH1TitleFlatten:
+    """The flatten optimization promotes h2 children of a matching h1 root
+    to top-level sections, optionally preserving an intro body as a
+    synthetic ``(intro)`` section."""
+
+    def _write_note(self, tmp_path: Path, name: str, body: str) -> Path:
+        note = tmp_path / name
+        note.write_text(body, encoding="utf-8")
+        return note
+
+    def test_flatten_when_filename_matches_h1(self, tmp_path: Path) -> None:
+        body = (
+            "# Paper\n"
+            "An abstract paragraph with real content lives here under "
+            "the h1 so we can verify it is preserved.\n"
+            "\n## Methods\n"
+            + ("Methods body line. " * 200)
+            + "\n\n## Results\n"
+            + ("Results body line. " * 200)
+            + "\n\n## Discussion\n"
+            + ("Discussion body line. " * 200)
+        )
+        note = self._write_note(tmp_path, "paper.md", body)
+        children = build_long_note_subtree(note, "paper", chat_fn=None)
+        titles = [c.title for c in children]
+        # Intro preserved, then h2 children promoted
+        assert titles == ["(intro)", "Methods", "Results", "Discussion"]
+        for child in children:
+            assert child.kind == "section"
+
+    def test_intro_section_line_range_covers_h1_body_only(
+        self, tmp_path: Path
+    ) -> None:
+        body = (
+            "# Paper\nAbstract: important content here.\n\n"
+            "## Methods\n" + ("methods body. " * 200)
+            + "\n\n## Results\n" + ("results body. " * 200)
+        )
+        note = self._write_note(tmp_path, "paper.md", body)
+        children = build_long_note_subtree(note, "paper", chat_fn=None)
+
+        intro = next(c for c in children if c.title == "(intro)")
+        assert intro.line_range is not None
+        start, end = intro.line_range
+        assert start == 1
+        assert end > start
+
+        # Loading the intro slice must include "Abstract:" but not any
+        # subsequent "## " header.
+        from pagewiki.retrieval import _load_note_content
+
+        sliced = _load_note_content(intro)
+        assert "Abstract:" in sliced
+        assert "## " not in sliced
+
+    def test_flatten_without_intro_body_omits_synthetic_section(
+        self, tmp_path: Path
+    ) -> None:
+        body = (
+            "# Paper\n## Methods\n"
+            + ("methods body. " * 200)
+            + "\n\n## Results\n"
+            + ("results body. " * 200)
+        )
+        note = self._write_note(tmp_path, "paper.md", body)
+        children = build_long_note_subtree(note, "paper", chat_fn=None)
+        titles = [c.title for c in children]
+        assert "(intro)" not in titles
+        assert titles == ["Methods", "Results"]
+
+    def test_no_flatten_when_filename_differs(self, tmp_path: Path) -> None:
+        body = "# Paper\nbody\n\n## Methods\n" + ("m " * 300)
+        note = self._write_note(tmp_path, "notes.md", body)
+        children = build_long_note_subtree(
+            note, "notes", chat_fn=None, if_thinning=False
+        )
+        # Root "Paper" is kept intact
+        assert len(children) == 1
+        assert children[0].title == "Paper"
+
+    def test_flatten_is_case_and_whitespace_insensitive(
+        self, tmp_path: Path
+    ) -> None:
+        body = "#    My  Paper   \n\n## Methods\n" + ("m " * 300)
+        note = self._write_note(tmp_path, "my_paper.md", body)
+        # Different case + extra whitespace; normalized comparison
+        # should still treat them as equal.
+        children = build_long_note_subtree(
+            note, "MY PAPER", chat_fn=None, if_thinning=False
+        )
+        assert [c.title for c in children] == ["Methods"]
+
+    def test_no_flatten_when_multiple_top_level_h1s(
+        self, tmp_path: Path
+    ) -> None:
+        body = (
+            "# Paper\nbody\n\n## Sub\ncontent\n\n"
+            "# Another Topic\nmore body\n\n## Sub2\n" + ("s " * 300)
+        )
+        note = self._write_note(tmp_path, "paper.md", body)
+        children = build_long_note_subtree(
+            note, "paper", chat_fn=None, if_thinning=False
+        )
+        titles = [c.title for c in children]
+        # Two h1s = ambiguous, no flatten
+        assert "Paper" in titles
+        assert "Another Topic" in titles
+
+    def test_no_flatten_when_h1_has_no_descendants(
+        self, tmp_path: Path
+    ) -> None:
+        body = "# Paper\nJust body text, no sub-sections."
+        note = self._write_note(tmp_path, "paper.md", body)
+        children = build_long_note_subtree(
+            note, "paper", chat_fn=None, if_thinning=False
+        )
+        # Single h1 with no descendants — nothing to flatten into.
+        assert len(children) == 1
+        assert children[0].title == "Paper"
+
+    def test_flatten_opt_out(self, tmp_path: Path) -> None:
+        body = "# Paper\nintro\n\n## Methods\n" + ("m " * 300)
+        note = self._write_note(tmp_path, "paper.md", body)
+        children = build_long_note_subtree(
+            note,
+            "paper",
+            chat_fn=None,
+            flatten_matching_h1=False,
+            if_thinning=False,
+        )
+        assert len(children) == 1
+        assert children[0].title == "Paper"
+        assert [c.title for c in children[0].children] == ["Methods"]
+
+    def test_intro_node_id_is_stable(self, tmp_path: Path) -> None:
+        """The synthetic intro id must be deterministic so the
+        retrieval visited_ids set and cache behave predictably."""
+        body = "# Paper\nabstract here\n\n## Methods\n" + ("m " * 300)
+        note = self._write_note(tmp_path, "paper.md", body)
+        children = build_long_note_subtree(
+            note, "paper", chat_fn=None, if_thinning=False
+        )
+        intro = next(c for c in children if c.title == "(intro)")
+        assert intro.node_id == "paper.md#intro"
+
+    def test_node_id_prefix_namespaces_sections(self, tmp_path: Path) -> None:
+        """Passing ``node_id_prefix`` should replace the bare-filename
+        default used by direct unit-test callers."""
+        body = "# Paper\nintro\n\n## Methods\n" + ("m " * 300)
+        note = self._write_note(tmp_path, "paper.md", body)
+        children = build_long_note_subtree(
+            note,
+            "paper",
+            chat_fn=None,
+            node_id_prefix="Research/paper.md",
+            if_thinning=False,
+        )
+        for child in children:
+            assert child.node_id.startswith("Research/paper.md#"), (
+                f"expected Research/paper.md# prefix, got {child.node_id!r}"
+            )

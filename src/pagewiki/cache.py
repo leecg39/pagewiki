@@ -33,7 +33,12 @@ from typing import Callable
 from .tree import TreeNode
 
 # Bump when the TreeNode serialization changes in an incompatible way.
-ADAPTER_VERSION = "v0.1.2"
+# v0.1.3: section node_ids are now namespaced by the vault-relative
+# path instead of the bare filename, and the h1-flatten optimization
+# can introduce a synthetic "(intro)" section. Both change the shape
+# of the cached children payload, so old v0.1.2 entries are forced to
+# rebuild on first access.
+ADAPTER_VERSION = "v0.1.3"
 
 CACHE_DIR_NAME = ".pagewiki-cache"
 TREES_SUBDIR = "trees"

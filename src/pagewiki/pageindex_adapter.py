@@ -59,6 +59,13 @@ DEFAULT_SUMMARY_TOKEN_THRESHOLD = 200
 # sub-sections do not inflate the tree depth.
 DEFAULT_THINNING_MIN_TOKENS = 500
 
+# v0.1.3: synthetic "(intro)" section created when the h1-flatten
+# optimization drops a wrapping h1 whose body carries non-empty text.
+# Preserving the text prevents abstracts / TL;DR paragraphs directly
+# under the title line from silently disappearing.
+INTRO_SECTION_TITLE = "(intro)"
+INTRO_SECTION_NODE_ID_SUFFIX = "intro"
+
 
 def build_long_note_subtree(
     note_path: Path,
@@ -68,6 +75,8 @@ def build_long_note_subtree(
     if_thinning: bool = True,
     thinning_min_tokens: int = DEFAULT_THINNING_MIN_TOKENS,
     summary_token_threshold: int = DEFAULT_SUMMARY_TOKEN_THRESHOLD,
+    node_id_prefix: str | None = None,
+    flatten_matching_h1: bool = True,
 ) -> list[TreeNode]:
     """Build a PageIndex-style section tree for one LONG markdown note.
 
@@ -86,12 +95,37 @@ def build_long_note_subtree(
             have many tiny headings.
         thinning_min_tokens: Token threshold for thinning.
         summary_token_threshold: Sections below this skip the LLM call.
+        node_id_prefix: String used to namespace section ``node_id`` s
+            so they are globally unique within a vault. Production
+            callers (``vault.build_long_subtrees``) pass the vault-
+            relative path, e.g. ``"Research/paper.md"``, so two notes
+            with the same filename in different folders produce
+            distinct ids like ``Research/paper.md#0002`` vs
+            ``Archive/paper.md#0002``. When ``None`` (the default used
+            by direct unit-test callers), falls back to the bare
+            filename — safe for tests but **unsafe for real vaults**
+            because the retrieval ``visited_ids`` set would silently
+            dedupe sections from same-named files and drop evidence.
+            (v0.1.3 — fixes PR #1 review comment.)
+        flatten_matching_h1: When ``True`` (default), notes that are
+            wrapped in a single h1 whose title matches ``note_title``
+            have that h1 promoted out — retrieval sees the h2 children
+            directly without a redundant one-choice ToC step. Any body
+            text that was directly under the h1 (abstract, TL;DR) is
+            preserved as a synthetic ``(intro)`` section so no content
+            is dropped. (v0.1.3 addition.)
 
     Returns:
         A list of ``TreeNode`` objects in pagewiki's schema, ready to
         assign to the parent LONG note's ``children`` field.
     """
     markdown_content = note_path.read_text(encoding="utf-8")
+
+    # Fall back to the bare filename when no prefix is provided — this
+    # preserves v0.1.2 behavior for unit tests that call the adapter
+    # directly. Production callers (vault.build_long_subtrees) MUST
+    # pass the vault-relative path.
+    effective_prefix = node_id_prefix if node_id_prefix is not None else note_path.name
 
     # Phase A: pure-python tree extraction (no LLM).
     raw_nodes, lines = extract_nodes_from_markdown(markdown_content)
@@ -101,6 +135,16 @@ def build_long_note_subtree(
         return []
 
     nodes_with_text = extract_node_text_content(raw_nodes, lines)
+
+    # Detect the flatten opportunity against the *pre-thinning* enriched
+    # list so any intro body text can be captured before thinning
+    # potentially folds it into a parent. Application of the flatten
+    # waits until after the tree is built so all preconditions
+    # (single root, title match, non-empty children) can be re-checked
+    # on the final TreeNode structure.
+    flatten_info: tuple[str, int, int] | None = None
+    if flatten_matching_h1:
+        flatten_info = _extract_intro_from_root(nodes_with_text, note_title)
 
     if if_thinning:
         nodes_with_text = update_node_list_with_text_token_count(nodes_with_text)
@@ -113,7 +157,7 @@ def build_long_note_subtree(
 
     # Phase B: translate upstream dict nodes into pagewiki TreeNode,
     # optionally calling chat_fn to generate per-section summaries.
-    return [
+    children = [
         _to_tree_node(
             raw,
             note_title=note_title,
@@ -122,9 +166,25 @@ def build_long_note_subtree(
             next_line_num=None,
             chat_fn=chat_fn,
             summary_token_threshold=summary_token_threshold,
+            node_id_prefix=effective_prefix,
         )
         for raw in _with_end_line(raw_tree, total_lines)
     ]
+
+    # Phase C (v0.1.3): if the tree ended up as a single h1 wrapper
+    # whose title matches the note, promote its children to top level.
+    if flatten_matching_h1:
+        children = _apply_h1_flatten(
+            children,
+            note_path=note_path,
+            note_title=note_title,
+            flatten_info=flatten_info,
+            chat_fn=chat_fn,
+            node_id_prefix=effective_prefix,
+            summary_token_threshold=summary_token_threshold,
+        )
+
+    return children
 
 
 def _with_end_line(
@@ -155,6 +215,7 @@ def _to_tree_node(
     next_line_num: int | None,
     chat_fn: ChatFn | None,
     summary_token_threshold: int,
+    node_id_prefix: str,
 ) -> TreeNode:
     """Convert an upstream PageIndex dict into a pagewiki ``TreeNode``.
 
@@ -178,11 +239,11 @@ def _to_tree_node(
         summary_token_threshold=summary_token_threshold,
     )
 
-    # Stable node id: "<note_rel_path>#<upstream_node_id>" would be ideal
-    # but we don't have the vault root here. The upstream zfill id is
-    # unique within the note, which is enough for visited_ids tracking
-    # in the retrieval loop (scoped per query).
-    node_id = f"{note_path.name}#{raw['node_id']}"
+    # Namespace section ids by the caller-supplied prefix (typically
+    # the vault-relative path) so two same-named notes in different
+    # folders don't collide in the retrieval ``visited_ids`` set.
+    # Fixes PR #1 review comment (v0.1.3).
+    node_id = f"{node_id_prefix}#{raw['node_id']}"
 
     child_raw = raw.get("nodes") or []
     paired_children = _with_end_line(child_raw, end_line - 1)
@@ -195,6 +256,7 @@ def _to_tree_node(
             next_line_num=None,
             chat_fn=chat_fn,
             summary_token_threshold=summary_token_threshold,
+            node_id_prefix=node_id_prefix,
         )
         for pair in paired_children
     ]
@@ -266,3 +328,157 @@ def _approx_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, len(text) // 3)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# h1-title flatten optimization (v0.1.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _normalize_title(title: str) -> str:
+    """Normalize a title for fuzzy equality: strip + lowercase + collapse ws."""
+    return " ".join(title.strip().lower().split())
+
+
+def _titles_match(a: str, b: str) -> bool:
+    """Case- and whitespace-insensitive title comparison."""
+    return _normalize_title(a) == _normalize_title(b)
+
+
+def _extract_intro_from_root(
+    enriched: list[dict],
+    note_title: str,
+) -> tuple[str, int, int] | None:
+    """Return ``(intro_text, h1_line, first_child_line)`` if flatten should apply.
+
+    Flatten fires when:
+      * the enriched list is non-empty,
+      * the first node is an h1,
+      * its title matches ``note_title`` (normalized),
+      * it is the ONLY top-level h1,
+      * it has at least one deeper descendant (otherwise there's
+        nothing to promote to the top level).
+
+    Returns ``None`` in any failing case, meaning "do not flatten".
+    """
+    if not enriched:
+        return None
+
+    root = enriched[0]
+    if root.get("level") != 1:
+        return None
+    if not _titles_match(root.get("title", ""), note_title):
+        return None
+
+    # ``root`` must be the only top-level h1 — two coequal h1s would be
+    # ambiguous and dropping one of them would lose sibling content.
+    for other in enriched[1:]:
+        if other.get("level") == 1:
+            return None
+
+    # The first descendant (level > 1) marks where the intro body ends.
+    first_child_line: int | None = None
+    for node in enriched[1:]:
+        if node.get("level", 0) > 1:
+            first_child_line = node["line_num"]
+            break
+    if first_child_line is None:
+        # h1 with no nested headings — nothing to flatten into.
+        return None
+
+    # Strip the leading "# Title" header out of the root's body.
+    raw_text = root.get("text", "")
+    body_lines = raw_text.split("\n")
+    if body_lines and body_lines[0].lstrip().startswith("#"):
+        body_lines = body_lines[1:]
+    intro_text = "\n".join(body_lines).strip()
+
+    return (intro_text, root["line_num"], first_child_line)
+
+
+def _apply_h1_flatten(
+    children: list[TreeNode],
+    *,
+    note_path: Path,
+    note_title: str,
+    flatten_info: tuple[str, int, int] | None,
+    chat_fn: ChatFn | None,
+    node_id_prefix: str,
+    summary_token_threshold: int,
+) -> list[TreeNode]:
+    """Promote a matching single-h1 root's children to the top level.
+
+    All preconditions are re-checked against the final ``TreeNode``
+    structure (thinning may have collapsed the tree further than the
+    pre-check assumed). If any fails, ``children`` is returned
+    unchanged.
+    """
+    if flatten_info is None:
+        return children
+    if len(children) != 1:
+        return children
+
+    root = children[0]
+    if root.kind != "section":
+        return children
+    if not _titles_match(root.title, note_title):
+        return children
+    if not root.children:
+        # Thinning folded everything into the root — flattening would
+        # yield an empty tree. Keep the root as-is.
+        return children
+
+    promoted: list[TreeNode] = list(root.children)
+
+    intro_text, h1_line, first_child_line = flatten_info
+    if intro_text:
+        intro_node = _make_intro_section(
+            note_path=note_path,
+            note_title=note_title,
+            intro_text=intro_text,
+            start_line=h1_line,
+            end_line=first_child_line,
+            chat_fn=chat_fn,
+            node_id_prefix=node_id_prefix,
+            summary_token_threshold=summary_token_threshold,
+        )
+        promoted = [intro_node, *promoted]
+
+    return promoted
+
+
+def _make_intro_section(
+    *,
+    note_path: Path,
+    note_title: str,
+    intro_text: str,
+    start_line: int,
+    end_line: int,
+    chat_fn: ChatFn | None,
+    node_id_prefix: str,
+    summary_token_threshold: int,
+) -> TreeNode:
+    """Build the synthetic ``(intro)`` section preserving h1 body text.
+
+    Its ``line_range`` spans from the h1 header line (inclusive) to
+    the first descendant header line (exclusive) so the retrieval
+    loader reads exactly the intro slice — no more, no less.
+    """
+    summary = _generate_section_summary(
+        note_title=note_title,
+        section_title=INTRO_SECTION_TITLE,
+        section_text=intro_text,
+        chat_fn=chat_fn,
+        summary_token_threshold=summary_token_threshold,
+    )
+
+    return TreeNode(
+        node_id=f"{node_id_prefix}#{INTRO_SECTION_NODE_ID_SUFFIX}",
+        title=INTRO_SECTION_TITLE,
+        summary=summary,
+        kind="section",
+        file_path=note_path,
+        token_count=_approx_tokens(intro_text),
+        line_range=(start_line, end_line),
+        children=[],
+    )
