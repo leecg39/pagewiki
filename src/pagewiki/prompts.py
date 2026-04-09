@@ -1,0 +1,194 @@
+"""Prompt templates for the multi-hop reasoning loop.
+
+Each template is a pure function of its inputs — no side effects, no LLM
+calls. This makes them trivially unit-testable and easy to iterate on.
+
+Phase names mirror docs/ARCHITECTURE.md §4:
+  1. ToC Review
+  2. Select Node
+  3. Extract & Evaluate
+  4. Final Answer
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class NodeSummary:
+    """Lightweight view of a tree node used when presenting options to the LLM.
+
+    We avoid passing full TreeNode objects into prompts so this module has
+    zero coupling to pydantic / tree.py.
+    """
+
+    node_id: str
+    title: str
+    kind: str  # folder | note | section
+    summary: str = ""
+    token_count: int | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1: ToC Review + Phase 2: Select Node
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SELECT_NODE_SYSTEM = (
+    "당신은 지식 베이스 탐색 전문가입니다. "
+    "사용자의 질문에 답하기 위해 가장 관련 있는 노드를 정확히 하나 선택합니다. "
+    "벡터 유사도가 아닌 논리적 추론에 기반해 판단하세요."
+)
+
+
+def select_node_prompt(
+    query: str,
+    candidates: list[NodeSummary],
+    *,
+    path_so_far: list[str] | None = None,
+) -> str:
+    """Build the prompt that asks the LLM to pick the next node to explore.
+
+    The LLM must respond with a single line in the format:
+        SELECT: <node_id>
+    or
+        DONE: <reason>   # if none of the candidates are relevant
+
+    path_so_far shows the breadcrumb of already-visited nodes so the model
+    doesn't loop back.
+    """
+    lines: list[str] = []
+    lines.append(_SELECT_NODE_SYSTEM)
+    lines.append("")
+    lines.append(f"[사용자 질문]\n{query}")
+    lines.append("")
+
+    if path_so_far:
+        lines.append(f"[지금까지 탐색한 경로]\n{' > '.join(path_so_far)}")
+        lines.append("")
+
+    lines.append("[선택 가능한 노드]")
+    for idx, cand in enumerate(candidates, start=1):
+        meta = f"[{cand.kind}]"
+        if cand.token_count is not None:
+            meta += f" ~{cand.token_count}토큰"
+        summary_part = f" — {cand.summary}" if cand.summary else ""
+        lines.append(f"{idx}. {meta} {cand.title}{summary_part}")
+        lines.append(f"   node_id: {cand.node_id}")
+    lines.append("")
+
+    lines.append(
+        "위 후보 중 질문에 가장 관련 있는 노드 하나를 선택하세요.\n"
+        "응답 형식은 반드시 아래 중 하나여야 합니다:\n"
+        "  SELECT: <node_id>\n"
+        "  DONE: <이유>  (관련 노드가 전혀 없을 때)\n"
+        "다른 설명은 추가하지 마세요."
+    )
+    return "\n".join(lines)
+
+
+def parse_select_response(response: str) -> tuple[str, str]:
+    """Parse the LLM's SELECT/DONE line.
+
+    Returns:
+        (action, value) where action ∈ {"SELECT", "DONE"}.
+
+    Raises:
+        ValueError: if the response doesn't match either format.
+    """
+    for line in response.strip().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("SELECT:"):
+            return "SELECT", stripped[len("SELECT:") :].strip()
+        if stripped.startswith("DONE:"):
+            return "DONE", stripped[len("DONE:") :].strip()
+    raise ValueError(f"Could not parse SELECT/DONE from response: {response!r}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3: Extract & Evaluate
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EVALUATE_SYSTEM = (
+    "당신은 지식 평가 전문가입니다. "
+    "주어진 노트 내용만으로 사용자 질문에 충분히 답할 수 있는지 판단하세요."
+)
+
+
+def evaluate_prompt(query: str, note_title: str, note_content: str) -> str:
+    """Ask the LLM whether the loaded note is sufficient to answer the query.
+
+    The LLM must respond with a single line:
+        SUFFICIENT: <one-line reason>
+    or
+        INSUFFICIENT: <what's missing>
+    """
+    return (
+        f"{_EVALUATE_SYSTEM}\n\n"
+        f"[사용자 질문]\n{query}\n\n"
+        f"[로드된 노트: {note_title}]\n{note_content[:12000]}\n\n"
+        "이 내용만으로 질문에 충분히 답할 수 있습니까?\n"
+        "응답 형식:\n"
+        "  SUFFICIENT: <한 줄 이유>\n"
+        "  INSUFFICIENT: <부족한 정보>\n"
+        "다른 설명은 추가하지 마세요."
+    )
+
+
+def parse_evaluate_response(response: str) -> tuple[bool, str]:
+    """Parse evaluation response into (is_sufficient, reason)."""
+    for line in response.strip().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("SUFFICIENT:"):
+            return True, stripped[len("SUFFICIENT:") :].strip()
+        if stripped.startswith("INSUFFICIENT:"):
+            return False, stripped[len("INSUFFICIENT:") :].strip()
+    raise ValueError(f"Could not parse SUFFICIENT/INSUFFICIENT: {response!r}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4: Final Answer
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FINAL_ANSWER_SYSTEM = (
+    "당신은 연구 어시스턴트입니다. "
+    "주어진 근거 노트들만 사용해 사용자 질문에 답변하세요. "
+    "근거에 없는 내용은 추측하지 말고 '근거 부족'이라고 명시하세요."
+)
+
+
+def final_answer_prompt(
+    query: str,
+    gathered_notes: list[tuple[str, str]],
+) -> str:
+    """Build the final answer prompt.
+
+    Args:
+        query: Original user question.
+        gathered_notes: List of (title, content) tuples collected during the loop.
+    """
+    lines = [_FINAL_ANSWER_SYSTEM, "", f"[사용자 질문]\n{query}", ""]
+    lines.append("[근거 노트]")
+    for idx, (title, content) in enumerate(gathered_notes, start=1):
+        lines.append(f"\n--- 노트 {idx}: {title} ---\n{content[:8000]}")
+    lines.append("")
+    lines.append(
+        "위 근거를 바탕으로 질문에 한국어로 답변하세요. "
+        "답변 끝에 참조한 노트 제목을 [[제목]] 형식으로 나열하세요."
+    )
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Atomic note summarization (used by vault layer)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def atomic_summary_prompt(title: str, content: str) -> str:
+    """One-line Korean summary prompt for an atomic note."""
+    return (
+        "다음 노트를 한국어 한 문장(100자 이내)으로 요약하세요. "
+        "문장 외 다른 텍스트는 출력하지 마세요.\n\n"
+        f"[제목] {title}\n\n"
+        f"[본문]\n{content[:4000]}"
+    )

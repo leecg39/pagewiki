@@ -14,9 +14,13 @@ free of LLM calls.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
+from .prompts import atomic_summary_prompt
 from .tree import NoteTier, TreeNode
+
+ChatFn = Callable[[str], str]
 
 # Heuristic: 1 token ≈ 4 chars for English, ≈ 2 chars for Korean.
 # Use the conservative English ratio; real tokenization happens in PageIndex.
@@ -108,3 +112,44 @@ def _build_folder_node(folder: Path, vault_root: Path) -> TreeNode:
             node.children.append(_note_to_node(entry, vault_root))
 
     return node
+
+
+def summarize_atomic_notes(
+    root: TreeNode,
+    chat_fn: ChatFn,
+    *,
+    skip_existing: bool = True,
+) -> int:
+    """Fill in one-line summaries for every tier=ATOMIC note under `root`.
+
+    Walks the Layer 1 tree and calls `chat_fn` once per ATOMIC note. MICRO
+    notes are skipped (title-only is fine) and LONG notes are handled by
+    the PageIndex adapter, so they're skipped here too.
+
+    Args:
+        root: Layer 1 tree root.
+        chat_fn: LLM callable (production: ollama_client.chat wrapper).
+        skip_existing: If True, don't re-summarize notes that already have a
+            non-empty `summary` field. Enables cheap incremental re-runs.
+
+    Returns:
+        Number of notes actually summarized (i.e. LLM calls made).
+    """
+    calls = 0
+    for node in root.walk():
+        if node.kind != "note" or node.tier != NoteTier.ATOMIC:
+            continue
+        if skip_existing and node.summary:
+            continue
+        if node.file_path is None:
+            continue
+
+        content = node.file_path.read_text(encoding="utf-8")
+        prompt = atomic_summary_prompt(node.title, content)
+        summary = chat_fn(prompt).strip()
+        # Strip quotes if the model wrapped its answer
+        summary = summary.strip("\"'").strip()
+        node.summary = summary
+        calls += 1
+
+    return calls

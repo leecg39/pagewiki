@@ -1,11 +1,8 @@
 """pagewiki command-line interface.
 
-MVP v0.1 commands:
-  pagewiki scan   — walk a vault folder, classify notes, print tier counts
-  pagewiki ask    — run a multi-hop reasoning query (stub; implemented in v0.1.1)
-
-`ask` currently returns a scaffolded response so the end-to-end plumbing
-is verifiable without requiring Ollama/PageIndex to be running.
+Commands:
+  pagewiki scan — walk a vault folder, classify notes, print tier counts
+  pagewiki ask  — run a full multi-hop reasoning query against a vault folder
 """
 
 from __future__ import annotations
@@ -20,10 +17,25 @@ from rich.table import Table
 
 from . import __version__
 from .logger import QueryRecord, write_log
+from .retrieval import run_retrieval
 from .tree import NoteTier
-from .vault import scan_folder
+from .vault import scan_folder, summarize_atomic_notes
 
 console = Console()
+
+
+def _make_chat_fn(model: str, num_ctx: int):
+    """Build a chat_fn closure bound to a specific Ollama model.
+
+    Imported lazily so `pagewiki scan` works even when LiteLLM / Ollama are
+    not installed locally.
+    """
+    from .ollama_client import chat
+
+    def _call(prompt: str) -> str:
+        return chat(prompt, model=model, num_ctx=num_ctx).text
+
+    return _call
 
 
 @click.group()
@@ -33,8 +45,14 @@ def main() -> None:
 
 
 @main.command()
-@click.option("--vault", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--folder", default=None, help="Subfolder inside the vault (e.g. Research).")
+@click.option(
+    "--vault",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--folder", default=None, help="Subfolder inside the vault (e.g. Research)."
+)
 def scan(vault: Path, folder: str | None) -> None:
     """Scan a vault folder and report 3-tier classification counts."""
     console.print(f"[bold cyan]Scanning[/] {vault}{('/' + folder) if folder else ''}")
@@ -65,39 +83,83 @@ def scan(vault: Path, folder: str | None) -> None:
 
 @main.command()
 @click.argument("query")
-@click.option("--vault", required=True, type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--folder", default="Research", help="Subfolder inside the vault. Default: Research")
-@click.option("--model", default="ollama/gemma4:26b", help="LiteLLM model id.")
-def ask(query: str, vault: Path, folder: str, model: str) -> None:
-    """Run a multi-hop reasoning query against a vault folder.
-
-    NOTE: v0.1 scaffold. The actual retrieval loop lands in v0.1.1.
-    """
+@click.option(
+    "--vault",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--folder", default="Research", help="Subfolder inside the vault. Default: Research"
+)
+@click.option(
+    "--model", default="ollama/gemma4:26b", help="LiteLLM model id."
+)
+@click.option(
+    "--num-ctx", default=131072, type=int, help="Ollama context window."
+)
+@click.option(
+    "--skip-summaries",
+    is_flag=True,
+    help="Skip the atomic-note summarization pass (faster, worse ToC).",
+)
+def ask(
+    query: str,
+    vault: Path,
+    folder: str,
+    model: str,
+    num_ctx: int,
+    skip_summaries: bool,
+) -> None:
+    """Run a multi-hop reasoning query against a vault folder."""
     console.print(f"[bold cyan]Q:[/] {query}")
     console.print(f"  vault={vault}  folder={folder}  model={model}\n")
 
     start = time.time()
+    chat_fn = _make_chat_fn(model, num_ctx)
+
+    # Step 1: scan
+    console.print("[dim]1/3 Scanning vault...[/]")
     root = scan_folder(vault, folder)
     note_count = sum(1 for n in root.walk() if n.kind == "note")
 
-    # v0.1 stub answer — real reasoning loop arrives in v0.1.1
-    stub_answer = (
-        f"[v0.1 scaffold] Scanned {note_count} notes in '{folder}'. "
-        "Multi-hop reasoning loop not yet implemented — see docs/ARCHITECTURE.md Phase 2."
-    )
+    if note_count == 0:
+        console.print(f"[red]No notes found in {vault / folder}[/]")
+        sys.exit(1)
+
+    # Step 2: summarize atomic notes (optional)
+    if not skip_summaries:
+        console.print("[dim]2/3 Summarizing atomic notes...[/]")
+        summarized = summarize_atomic_notes(root, chat_fn)
+        console.print(f"[dim]    → {summarized} notes summarized[/]")
+    else:
+        console.print("[dim]2/3 Skipping summarization (--skip-summaries)[/]")
+
+    # Step 3: retrieval loop
+    console.print("[dim]3/3 Running multi-hop retrieval loop...[/]\n")
+    result = run_retrieval(query, root, chat_fn)
+
     elapsed = time.time() - start
 
-    console.print(f"[bold green]A:[/] {stub_answer}")
+    console.print(f"[bold green]A:[/] {result.answer}\n")
+
+    if result.cited_nodes:
+        console.print("[bold]Cited nodes:[/]")
+        for cited in result.cited_nodes:
+            console.print(f"  • {cited}")
+
+    console.print(
+        f"\n[dim]iterations={result.iterations_used}  elapsed={elapsed:.1f}s[/]"
+    )
 
     record = QueryRecord(
         query=query,
-        answer=stub_answer,
-        cited_nodes=[],
+        answer=result.answer,
+        cited_nodes=result.cited_nodes,
         model=model,
         elapsed_seconds=elapsed,
     )
     log_path = write_log(vault / folder, record)
-    console.print(f"\n[dim]Logged to {log_path}[/]")
+    console.print(f"[dim]Logged to {log_path}[/]")
 
 
 if __name__ == "__main__":
