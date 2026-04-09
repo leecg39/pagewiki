@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# pagewiki runtime
+.pagewiki-log/
+*.tree.json
+.env
+.env.local
+
+# Ollama models (don't commit)
+models/
+
+# Obsidian test vault (if bundled for dev)
+test-vault/.obsidian/workspace*
