@@ -63,12 +63,24 @@ pip install -e .
 ## 사용법
 
 ```bash
-# 단일 폴더에 대해 질의
+# 등록된 Obsidian 볼트 목록 확인 (notesmd-cli 또는 obsidian.json에서 자동 감지)
+pagewiki vaults
+
+# --vault 생략하면 기본 볼트 자동 감지 (v0.1.5+)
+pagewiki scan --folder Research
+pagewiki scan --show-graph                     # 전체 볼트 + 링크 그래프
+
+# 명시적으로 vault 지정도 여전히 가능 (공백 경로는 따옴표)
 pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
-  --vault ~/Documents/Obsidian \
+  --vault "~/Documents/Obsidian Vault" \
   --folder Research \
   --model ollama/gemma4:26b
 ```
+
+[Yakitrak/notesmd-cli](https://github.com/Yakitrak/notesmd-cli)를 설치해 두면:
+- `--vault` 생략 시 `notesmd-cli print-default`로 기본 볼트 자동 감지
+- `pagewiki ask` 출력 하단에 `notesmd-cli open <note> --section <anchor>` 명령이
+  자동 생성되어 인용된 섹션을 바로 editor에서 열 수 있음
 
 파이프라인은 4단계로 구성됩니다 (v0.1.2):
 
@@ -88,8 +100,10 @@ pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
 - v0.1: Literature 폴더 Deep-Research 모드 (단일 폴더)
 - v0.1.1: Multi-hop reasoning 루프 (ToC Review → Select → Evaluate → Final)
 - v0.1.2: PageIndex 실제 통합 — LONG 노트의 섹션 트리 빌드 + 디스크 캐시 + 섹션 단위 descend
-- **v0.1.3 (현재)**: h1-title flatten 최적화 + `(intro)` 보존 / vault-relative section id (collision fix) / Ollama smoke test 스크립트 + real-vault 벤치마크 harness + `docs/BENCHMARKING.md`
-- **v0.2**: 복수 폴더 + `[[wiki-link]]` cross-reference
+- v0.1.3: h1-title flatten + `(intro)` 보존 / vault-relative section id / local validation scripts
+- v0.1.4: `[[wiki-link]]` resolution index + `scan --show-graph` (PR #2)
+- **v0.1.5 (현재)**: notesmd-cli 통합 — `--vault` auto-discovery, `pagewiki vaults` 서브커맨드, `ask` citation을 `notesmd-cli open` 힌트로 표시
+- **v0.2**: `[[wiki-link]]` retrieval traversal (다음 마일스톤)
 - **v0.3**: Karpathy LLM-Wiki compiler 통합
 - **v0.4**: 증분 재인덱싱 + 파일 watcher
 - **v0.5**: Obsidian 플러그인 UI
