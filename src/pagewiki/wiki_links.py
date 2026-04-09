@@ -208,6 +208,54 @@ def _collect_notes(root: TreeNode) -> list[TreeNode]:
     return [n for n in root.walk() if n.kind == "note"]
 
 
+def _resolve_target(
+    raw_target: str,
+    title_index: dict[str, list[TreeNode]],
+) -> list[TreeNode]:
+    """Resolve a ``raw_target`` string to zero or more notes.
+
+    Obsidian supports three link shapes on the target side:
+
+      * ``[[Title]]``             — bare title, resolved via the
+                                    normalized-title index.
+      * ``[[folder/Title]]``      — path-prefixed title. Used by users
+                                    to disambiguate two notes that
+                                    share a title but live in
+                                    different folders.
+      * ``[[a/b/c/Title]]``       — deeper path prefix (same rule).
+
+    The normalized title index is keyed by *bare* title only, so we
+    split ``raw_target`` on the last ``/`` to recover the title, look
+    that up, and — when a path prefix is present — filter the
+    candidates to those whose file path ends with the specified
+    ``{prefix}/{title}.md`` suffix.
+
+    A path prefix that matches nothing returns an empty list rather
+    than silently falling back to bare-title resolution; if the user
+    typed ``[[wrong-folder/rag]]`` we would rather surface it as
+    dangling than cross-link to an unintended note.
+    """
+    if "/" in raw_target:
+        path_prefix, bare_title = raw_target.rsplit("/", 1)
+    else:
+        path_prefix, bare_title = "", raw_target
+
+    normalized = normalize_title(bare_title)
+    candidates = title_index.get(normalized, [])
+
+    if not path_prefix:
+        return list(candidates)
+
+    suffix = f"{path_prefix}/{bare_title}.md"
+    filtered = [
+        n
+        for n in candidates
+        if n.file_path is not None
+        and n.file_path.as_posix().endswith(suffix)
+    ]
+    return filtered
+
+
 def _build_title_index(
     notes: list[TreeNode],
 ) -> dict[str, list[TreeNode]]:
@@ -323,8 +371,7 @@ def build_link_index(
             continue
 
         for raw_target, anchor in _extract_links_with_anchors(text):
-            normalized = normalize_title(raw_target)
-            matches = title_index.get(normalized, [])
+            matches = _resolve_target(raw_target, title_index)
 
             if not matches:
                 dangling.append((note.node_id, raw_target))

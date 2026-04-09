@@ -166,6 +166,82 @@ class TestLinkIndexAmbiguity:
         assert stats.ambiguous_links == 1
 
 
+class TestPathPrefixedWikilinks:
+    """Obsidian allows ``[[folder/Note]]`` to both target a note in
+    ``folder/`` and, when multiple notes share a title, to
+    disambiguate between them via the path prefix. v0.1.4 must honor
+    that syntax — an earlier version resolved the literal string
+    ``"folder/Note"`` against the title index and lost every such link
+    to ``dangling()``.
+    """
+
+    def test_path_prefixed_link_resolves(self, tmp_path: Path) -> None:
+        vault = tmp_path / "vault"
+        concepts = vault / "concepts"
+        concepts.mkdir(parents=True)
+
+        (concepts / "rag.md").write_text("# RAG\nbody.\n", encoding="utf-8")
+        (vault / "index.md").write_text(
+            "# Index\nSee [[concepts/rag]].\n", encoding="utf-8"
+        )
+
+        root = scan_folder(vault)
+        index = build_link_index(root)
+
+        outgoing = index.outgoing("index.md")
+        assert len(outgoing) == 1, "path-prefixed link must resolve"
+        assert outgoing[0].target.title == "rag"
+        # Nothing should be dangling.
+        assert index.dangling() == []
+
+    def test_path_prefix_disambiguates_same_title(
+        self, tmp_path: Path
+    ) -> None:
+        """When two notes share a title, the path prefix picks one."""
+        vault = tmp_path / "vault"
+        (vault / "folder-a").mkdir(parents=True)
+        (vault / "folder-b").mkdir(parents=True)
+
+        (vault / "folder-a" / "Note.md").write_text(
+            "# Note A\n", encoding="utf-8"
+        )
+        (vault / "folder-b" / "Note.md").write_text(
+            "# Note B\n", encoding="utf-8"
+        )
+        (vault / "caller.md").write_text(
+            "# Caller\nOnly A: [[folder-a/Note]].\n", encoding="utf-8"
+        )
+
+        root = scan_folder(vault)
+        index = build_link_index(root)
+
+        outgoing = index.outgoing("caller.md")
+        # Exactly one resolved link, pointing at folder-a, not both.
+        assert len(outgoing) == 1
+        assert outgoing[0].target.node_id == "folder-a/Note.md"
+
+    def test_path_prefix_without_match_is_dangling(
+        self, tmp_path: Path
+    ) -> None:
+        """A path prefix that doesn't match any note stays dangling;
+        we do not silently fall back to bare-title resolution."""
+        vault = tmp_path / "vault"
+        (vault / "concepts").mkdir(parents=True)
+        (vault / "concepts" / "rag.md").write_text(
+            "# RAG\n", encoding="utf-8"
+        )
+        (vault / "caller.md").write_text(
+            "# Caller\nSee [[wrong-folder/rag]].\n", encoding="utf-8"
+        )
+
+        root = scan_folder(vault)
+        index = build_link_index(root)
+
+        assert index.outgoing("caller.md") == []
+        dangling_targets = [raw for _, raw in index.dangling()]
+        assert "wrong-folder/rag" in dangling_targets
+
+
 class TestLinkIndexOutgoingAndBacklinks:
     def test_outgoing_lists_only_resolved_links(
         self, simple_vault: Path
