@@ -294,15 +294,35 @@ def _compute_stats(
 
     # Top linked-to: count backlinks per target *note title*, not per
     # section node_id, so section-anchor hits and note-root hits
-    # aggregate under the same parent. Walk backlinks and attribute
-    # each one to its target note's title.
+    # aggregate under the same parent. When Q2's anchor fallback
+    # resolves ``[[Paper#Methods]]`` to a section node, the stored
+    # target is the section TreeNode (``kind == "section"``) — we
+    # have to walk up from the section to its enclosing note before
+    # recording the incoming count, otherwise a popular paper with
+    # anchor links gets its inbound count scattered across every
+    # section heading ("Methods", "Results", …) that happens to be
+    # referenced. Regression for PR #2 chatgpt-codex-connector P2.
+    notes_by_id: dict[str, TreeNode] = {n.node_id: n for n in notes}
+
+    def _display_title_for(target: TreeNode) -> str:
+        """Return the title pagewiki should show in top_linked_to for a
+        given resolved target. Section targets are attributed to their
+        enclosing note (via the ``<rel_path>#<id>`` node_id convention);
+        note targets use their own title."""
+        if target.kind == "section" and "#" in target.node_id:
+            enclosing_note_id = target.node_id.rsplit("#", 1)[0]
+            enclosing_note = notes_by_id.get(enclosing_note_id)
+            if enclosing_note is not None:
+                return enclosing_note.title
+        return target.title
+
     incoming_per_title: dict[str, int] = defaultdict(int)
     for target_id, links in backlinks.items():
         if not links:
             continue
-        # Take the title from the first link's target; all entries
-        # under this key share the same target node by construction.
-        title = links[0].target.title
+        # All entries under this key share the same target node by
+        # construction, so we read the display title once per bucket.
+        title = _display_title_for(links[0].target)
         incoming_per_title[title] += len(links)
     top_linked_to = sorted(
         incoming_per_title.items(), key=lambda kv: (-kv[1], kv[0])
@@ -312,6 +332,8 @@ def _compute_stats(
     for source_id, links in outgoing.items():
         if not links:
             continue
+        # source is always a note (``build_link_index`` iterates notes
+        # only), so no enclosing-note lookup is needed here.
         title = links[0].source.title
         outgoing_per_title[title] += len(links)
     top_outgoing = sorted(

@@ -510,6 +510,93 @@ class TestLinkIndexStats:
         top_out_dict = dict(stats.top_outgoing)
         assert top_out_dict.get("gamma") == 2
 
+    def test_incoming_count_attributes_to_enclosing_note_not_section(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for PR #2 chatgpt-codex-connector P2 review:
+
+        ``_compute_stats`` used to key ``top_linked_to`` by
+        ``links[0].target.title``. When a link like
+        ``[[Paper#Methods]]`` resolved through Q2's anchor fallback,
+        ``target`` was the section TreeNode and ``target.title`` was
+        the section heading ("Methods"), so the incoming count showed
+        up under the section heading instead of the enclosing note.
+
+        With several anchor-using notes in a vault, a single popular
+        paper would get its inbound link count scattered across
+        section heading titles (Methods, Results, Discussion, ...)
+        and none of them would rank correctly in ``top_linked_to``.
+
+        The fix walks up from each section target to its enclosing
+        note via the ``<rel_path>#<id>`` node_id convention and
+        attributes the count to the note's title instead.
+        """
+        vault = tmp_path / "vault"
+        notes_dir = vault / "Notes"
+        notes_dir.mkdir(parents=True)
+
+        # A target note that will have a section injected below.
+        (notes_dir / "paper.md").write_text(
+            "# Paper\nbody text.\n", encoding="utf-8"
+        )
+        # Two separate reviewer notes that both link to Paper via
+        # section anchors, so the bug-before-fix would split Paper's
+        # incoming count into "Methods"=1 and "Results"=1 instead of
+        # recording a single "paper"=2.
+        (notes_dir / "reviewer_a.md").write_text(
+            "# Reviewer A\nSee [[Paper#Methods]] for details.\n",
+            encoding="utf-8",
+        )
+        (notes_dir / "reviewer_b.md").write_text(
+            "# Reviewer B\nSee [[Paper#Results]] for the numbers.\n",
+            encoding="utf-8",
+        )
+
+        root = scan_folder(vault, "Notes")
+
+        # Inject synthetic Methods + Results section children onto
+        # paper.md so the anchor-matching path actually fires and
+        # the backlinks get keyed by section node_ids.
+        paper_note = next(
+            n for n in root.walk() if n.kind == "note" and n.title == "paper"
+        )
+        paper_note.children = [
+            TreeNode(
+                node_id="Notes/paper.md#0001",
+                title="Methods",
+                kind="section",
+                file_path=paper_note.file_path,
+                line_range=(2, 5),
+            ),
+            TreeNode(
+                node_id="Notes/paper.md#0002",
+                title="Results",
+                kind="section",
+                file_path=paper_note.file_path,
+                line_range=(5, 10),
+            ),
+        ]
+
+        index = build_link_index(root)
+        stats = index.stats()
+
+        top_titles = {title: count for title, count in stats.top_linked_to}
+
+        # Core assertion: both anchor links attribute to "paper", not
+        # to "Methods" / "Results" section headings.
+        assert top_titles.get("paper") == 2, (
+            f"expected paper to have 2 incoming links, got top_linked_to={stats.top_linked_to!r}"
+        )
+        assert "Methods" not in top_titles, (
+            f"section heading 'Methods' must not appear in top_linked_to; "
+            f"incoming count belongs to its enclosing note. "
+            f"Got top_linked_to={stats.top_linked_to!r}"
+        )
+        assert "Results" not in top_titles, (
+            f"section heading 'Results' must not appear in top_linked_to. "
+            f"Got top_linked_to={stats.top_linked_to!r}"
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Miscellaneous
