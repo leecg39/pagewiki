@@ -13,6 +13,7 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import __version__
@@ -39,6 +40,21 @@ def _make_chat_fn(model: str, num_ctx: int):
     return _call
 
 
+def _format_dangling_line(source_id: str, raw_target: str) -> str:
+    """Format one dangling-link line for Rich console rendering.
+
+    Both ``source_id`` and ``raw_target`` come from user vault data
+    (file paths and wiki-link targets), so they may contain characters
+    that Rich parses as markup — most notably square brackets, which
+    turn ``[[raw_target]]`` into a vanishing style tag. We escape both
+    fields before splicing them into the final markup string so the
+    original text is preserved verbatim.
+    """
+    safe_source = escape(source_id)
+    safe_target = escape(raw_target)
+    return f"  [yellow]{safe_source}[/] → \\[\\[{safe_target}]]"
+
+
 @click.group()
 @click.version_option(__version__, prog_name="pagewiki")
 def main() -> None:
@@ -60,11 +76,22 @@ def main() -> None:
     help="Eagerly build PageIndex sub-trees for every LONG note (no LLM; uses cache).",
 )
 @click.option(
+    "--show-graph",
+    is_flag=True,
+    help="Also print the [[wiki-link]] graph summary (totals, dangling, top nodes).",
+)
+@click.option(
     "--model",
     default="ollama/gemma4:26b",
     help="Model id used as part of the cache key for --build-long.",
 )
-def scan(vault: Path, folder: str | None, build_long: bool, model: str) -> None:
+def scan(
+    vault: Path,
+    folder: str | None,
+    build_long: bool,
+    show_graph: bool,
+    model: str,
+) -> None:
     """Scan a vault folder and report 3-tier classification counts."""
     console.print(f"[bold cyan]Scanning[/] {vault}{('/' + folder) if folder else ''}")
     root = scan_folder(vault, folder)
@@ -104,6 +131,48 @@ def scan(vault: Path, folder: str | None, build_long: bool, model: str) -> None:
         console.print(
             f"[dim]    → {built} built, {from_cache} from cache[/]"
         )
+
+    if show_graph:
+        from .wiki_links import build_link_index
+
+        console.print()
+        index = build_link_index(root)
+        stats = index.stats()
+
+        graph_table = Table(title="Wiki-Link Graph")
+        graph_table.add_column("Metric", style="bold")
+        graph_table.add_column("Value", justify="right")
+        graph_table.add_row("Total resolved links", str(stats.total_links))
+        graph_table.add_row("Dangling links", str(stats.dangling_count))
+        graph_table.add_row("Ambiguous (>1 candidate)", str(stats.ambiguous_links))
+        console.print(graph_table)
+
+        if stats.top_linked_to:
+            top_in = Table(title="Top linked-to notes")
+            top_in.add_column("Note", style="bold")
+            top_in.add_column("Incoming", justify="right")
+            for title, count in stats.top_linked_to:
+                top_in.add_row(title, str(count))
+            console.print(top_in)
+
+        if stats.top_outgoing:
+            top_out = Table(title="Top outgoing notes")
+            top_out.add_column("Note", style="bold")
+            top_out.add_column("Outgoing", justify="right")
+            for title, count in stats.top_outgoing:
+                top_out.add_row(title, str(count))
+            console.print(top_out)
+
+        if stats.dangling_count > 0:
+            console.print(
+                f"\n[bold yellow]Dangling links ({stats.dangling_count}):[/]"
+            )
+            for source_id, raw_target in index.dangling()[:10]:
+                console.print(_format_dangling_line(source_id, raw_target))
+            if stats.dangling_count > 10:
+                console.print(
+                    f"  [dim]… and {stats.dangling_count - 10} more[/]"
+                )
 
 
 @main.command()

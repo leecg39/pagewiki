@@ -36,6 +36,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from ._text import normalize_title as _normalize_title, titles_match as _titles_match
 from ._vendor.pageindex import (
     build_tree_from_nodes,
     extract_node_text_content,
@@ -333,16 +334,6 @@ def _approx_tokens(text: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # h1-title flatten optimization (v0.1.3)
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def _normalize_title(title: str) -> str:
-    """Normalize a title for fuzzy equality: strip + lowercase + collapse ws."""
-    return " ".join(title.strip().lower().split())
-
-
-def _titles_match(a: str, b: str) -> bool:
-    """Case- and whitespace-insensitive title comparison."""
-    return _normalize_title(a) == _normalize_title(b)
 
 
 def _extract_intro_from_root(
