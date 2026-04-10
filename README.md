@@ -70,6 +70,9 @@ pagewiki vaults
 pagewiki scan --folder Research
 pagewiki scan --show-graph                     # 전체 볼트 + 링크 그래프
 
+# LLM-Wiki 컴파일 (v0.3+): entity 추출 → 위키 페이지 자동 생성
+pagewiki compile --folder Research             # → {vault}/LLM-Wiki/
+
 # 명시적으로 vault 지정도 여전히 가능 (공백 경로는 따옴표)
 pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
   --vault "~/Documents/Obsidian Vault" \
@@ -103,8 +106,8 @@ pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
 - v0.1.3: h1-title flatten + `(intro)` 보존 / vault-relative section id / local validation scripts
 - v0.1.4: `[[wiki-link]]` resolution index + `scan --show-graph` (PR #2)
 - v0.1.5: notesmd-cli 통합 — `--vault` auto-discovery, `pagewiki vaults` 서브커맨드, `ask` citation을 `notesmd-cli open` 힌트로 표시
-- **v0.2 (현재)**: `[[wiki-link]]` retrieval traversal — 노트 평가 후 outgoing wiki-link를 교차참조 후보로 자동 추가, transitive chain following
-- **v0.3**: Karpathy LLM-Wiki compiler 통합
+- v0.2: `[[wiki-link]]` retrieval traversal — 노트 평가 후 outgoing wiki-link를 교차참조 후보로 자동 추가, transitive chain following
+- **v0.3 (현재)**: Karpathy LLM-Wiki compiler — `pagewiki compile`로 entity 추출 → 위키 페이지 자동 생성 → `{vault}/LLM-Wiki/`에 교차참조된 위키 출력
 - **v0.4**: 증분 재인덱싱 + 파일 watcher
 - **v0.5**: Obsidian 플러그인 UI
 

@@ -185,7 +185,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.1.3 | h1-title flatten + `(intro)` 보존, vault-relative section id, local validation scripts |
 | v0.1.4 | `[[wiki-link]]` resolution **index** + `scan --show-graph` (v0.2 Phase 1, PR #2) |
 | v0.1.5 | notesmd-cli 통합 — `--vault` auto-discovery, `pagewiki vaults` 서브커맨드, `ask` 출력에 `notesmd-cli open` 힌트 |
-| **v0.2** (현재) | **`[[wiki-link]]` retrieval traversal** — 노트 평가 후 outgoing wiki-link 대상을 교차참조 후보로 자동 추가, 프롬프트에 `[교차참조]` 태그 표시, transitive chain following |
+| v0.2 | `[[wiki-link]]` retrieval traversal — 노트 평가 후 outgoing wiki-link 대상을 교차참조 후보로 자동 추가, 프롬프트에 `[교차참조]` 태그 표시, transitive chain following |
+| **v0.3** (현재) | **Karpathy LLM-Wiki compiler** — `pagewiki compile` 서브커맨드, 2-pass 파이프라인 (entity 추출 → 위키 페이지 생성), `{vault}/LLM-Wiki/` 출력, `index.md` 카탈로그 + `log.md` 감사추적 |
 | v0.3 | Karpathy LLM-Wiki compiler (entity 추출 → `LLM-Wiki/` 폴더) |
 | v0.4 | 증분 재인덱싱 + mtime 기반 watcher |
 | v0.5 | Obsidian 플러그인 UI |

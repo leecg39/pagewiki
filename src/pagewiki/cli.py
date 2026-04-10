@@ -336,6 +336,62 @@ def vaults() -> None:
 
 
 @main.command()
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root. If omitted, auto-discovered.",
+)
+@click.option(
+    "--folder", default=None, help="Subfolder inside the vault (e.g. Research)."
+)
+@click.option(
+    "--model", default="ollama/gemma4:26b", help="LiteLLM model id."
+)
+@click.option(
+    "--num-ctx", default=131072, type=int, help="Ollama context window."
+)
+def compile(
+    vault: Path | None,
+    folder: str | None,
+    model: str,
+    num_ctx: int,
+) -> None:
+    """Compile vault notes into an LLM-Wiki (entity pages + index).
+
+    Extracts entities from every note, generates cross-referenced wiki
+    pages, and writes them to ``{vault}/LLM-Wiki/``. Follows Karpathy's
+    LLM-Wiki pattern: raw sources → entity extraction → wiki compilation.
+    """
+    from .compile import compile_wiki
+
+    vault = _resolve_vault(vault)
+    console.print(
+        f"[bold cyan]Compiling LLM-Wiki[/] from "
+        f"{vault}{('/' + folder) if folder else ''}"
+    )
+
+    root = scan_folder(vault, folder)
+    note_count = sum(1 for n in root.walk() if n.kind == "note")
+    if note_count == 0:
+        console.print("[red]No notes found to compile.[/]")
+        sys.exit(1)
+
+    console.print(f"[dim]Found {note_count} notes to process...[/]")
+
+    chat_fn = _make_chat_fn(model, num_ctx)
+    wiki_dir = compile_wiki(root, vault, chat_fn, subfolder=folder)
+
+    # Count generated files
+    generated = list(wiki_dir.glob("*.md"))
+    console.print(
+        f"\n[bold green]LLM-Wiki compiled![/] "
+        f"{len(generated)} pages written to {wiki_dir}"
+    )
+    console.print(f"[dim]Open in Obsidian: index.md is the entry point.[/]")
+
+
+@main.command()
 @click.argument("query")
 @click.option(
     "--vault",
