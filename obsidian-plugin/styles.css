@@ -7,3 +7,21 @@
 	padding: 12px 16px;
 	font-family: var(--font-monospace);
 }
+
+/* Chat modal (v0.6) */
+.pagewiki-chat-modal {
+	min-width: 600px;
+}
+
+.pagewiki-chat-messages {
+	background-color: var(--background-secondary);
+}
+
+.pagewiki-chat-msg {
+	padding: 4px 0;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.pagewiki-chat-msg:last-child {
+	border-bottom: none;
+}

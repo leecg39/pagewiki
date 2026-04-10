@@ -1,7 +1,7 @@
 /**
- * PageWiki Obsidian Plugin (v0.5)
+ * PageWiki Obsidian Plugin (v0.6)
  *
- * Wraps the pagewiki CLI so users can scan, ask, compile, and watch
+ * Wraps the pagewiki CLI so users can scan, ask, chat, compile, and watch
  * from within Obsidian — no terminal switching required.
  *
  * Commands are executed via Node child_process.exec against the
@@ -176,6 +176,205 @@ class AskModal extends Modal {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Chat Modal (v0.6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ChatMessage {
+	role: "user" | "assistant";
+	text: string;
+}
+
+class ChatModal extends Modal {
+	private settings: PageWikiSettings;
+	private messages: ChatMessage[] = [];
+	private messagesEl!: HTMLElement;
+	private inputEl!: HTMLTextAreaElement;
+	private submitBtn!: HTMLButtonElement;
+	private busy = false;
+
+	constructor(app: App, settings: PageWikiSettings) {
+		super(app);
+		this.settings = settings;
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.addClass("pagewiki-chat-modal");
+
+		contentEl.createEl("h2", { text: "PageWiki Chat" });
+		contentEl.createEl("p", {
+			text: `Model: ${this.settings.model} | Folder: ${this.settings.folder}`,
+			cls: "setting-item-description",
+		});
+
+		// Messages container
+		this.messagesEl = contentEl.createDiv({ cls: "pagewiki-chat-messages" });
+		this.messagesEl.style.maxHeight = "50vh";
+		this.messagesEl.style.overflowY = "auto";
+		this.messagesEl.style.marginBottom = "12px";
+		this.messagesEl.style.padding = "8px";
+		this.messagesEl.style.border = "1px solid var(--background-modifier-border)";
+		this.messagesEl.style.borderRadius = "6px";
+
+		this._appendSystemMessage("대화를 시작하세요. 후속 질문이 이전 맥락을 이어받습니다.");
+
+		// Input area
+		const inputWrapper = contentEl.createDiv();
+		inputWrapper.style.display = "flex";
+		inputWrapper.style.gap = "8px";
+
+		const ta = new TextAreaComponent(inputWrapper);
+		ta.setPlaceholder("질문을 입력하세요... (Enter 전송, Shift+Enter 줄바꿈)");
+		ta.inputEl.style.flex = "1";
+		ta.inputEl.style.height = "60px";
+		ta.inputEl.style.resize = "vertical";
+		this.inputEl = ta.inputEl;
+
+		this.submitBtn = inputWrapper.createEl("button", {
+			text: "Send",
+			cls: "mod-cta",
+		});
+		this.submitBtn.style.alignSelf = "flex-end";
+		this.submitBtn.addEventListener("click", () => this._handleSubmit());
+
+		this.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
+			if (e.key === "Enter" && !e.shiftKey) {
+				e.preventDefault();
+				this._handleSubmit();
+			}
+		});
+
+		this.inputEl.focus();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+
+	private _appendSystemMessage(text: string): void {
+		const el = this.messagesEl.createDiv({ cls: "pagewiki-chat-system" });
+		el.style.color = "var(--text-muted)";
+		el.style.fontStyle = "italic";
+		el.style.fontSize = "12px";
+		el.style.marginBottom = "8px";
+		el.setText(text);
+	}
+
+	private _appendMessage(msg: ChatMessage): void {
+		this.messages.push(msg);
+
+		const wrapper = this.messagesEl.createDiv({ cls: "pagewiki-chat-msg" });
+		wrapper.style.marginBottom = "12px";
+
+		const label = wrapper.createEl("strong");
+		label.style.color = msg.role === "user"
+			? "var(--text-accent)"
+			: "var(--text-success)";
+		label.setText(msg.role === "user" ? "Q: " : "A: ");
+
+		const body = wrapper.createEl("span");
+		body.style.whiteSpace = "pre-wrap";
+		body.setText(msg.text);
+
+		this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+	}
+
+	private _buildContextQuery(query: string): string {
+		// Prepend recent history as context so the single `ask` call
+		// can benefit from prior turns. Limited to last 3 turns.
+		if (this.messages.length === 0) return query;
+
+		const pairs: string[] = [];
+		const msgs = this.messages;
+		let i = msgs.length - 1;
+		let turns = 0;
+		while (i >= 0 && turns < 3) {
+			if (msgs[i].role === "assistant" && i > 0 && msgs[i - 1].role === "user") {
+				pairs.unshift(`Previous Q: ${msgs[i - 1].text}\nPrevious A: ${msgs[i].text.substring(0, 300)}`);
+				i -= 2;
+				turns++;
+			} else {
+				i--;
+			}
+		}
+
+		if (pairs.length === 0) return query;
+		return `[대화 맥락]\n${pairs.join("\n\n")}\n\n[현재 질문]\n${query}`;
+	}
+
+	private async _handleSubmit(): Promise<void> {
+		const query = this.inputEl.value.trim();
+		if (!query || this.busy) return;
+
+		this.inputEl.value = "";
+		this._appendMessage({ role: "user", text: query });
+
+		this.busy = true;
+		this.submitBtn.setText("...");
+		this.submitBtn.disabled = true;
+
+		try {
+			const contextQuery = this._buildContextQuery(query);
+			const escaped = contextQuery.replace(/"/g, '\\"');
+			const args =
+				`ask "${escaped}" --folder "${this.settings.folder}" ` +
+				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx}`;
+			const output = await runPagewiki(this.app, this.settings, args);
+
+			// Extract the answer line from CLI output (after "A: ")
+			const answer = this._extractAnswer(output);
+			this._appendMessage({ role: "assistant", text: answer });
+		} catch (e: any) {
+			this._appendSystemMessage(`Error: ${e.message}`);
+		} finally {
+			this.busy = false;
+			this.submitBtn.setText("Send");
+			this.submitBtn.disabled = false;
+			this.inputEl.focus();
+		}
+	}
+
+	/** Parse the answer from pagewiki ask CLI output. */
+	private _extractAnswer(output: string): string {
+		const lines = output.split("\n");
+		let answerStart = -1;
+		let citedStart = -1;
+
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i].startsWith("A: ") || lines[i].startsWith("A:")) {
+				answerStart = i;
+			}
+			if (lines[i].startsWith("Cited nodes:") || lines[i].startsWith("Cited:")) {
+				citedStart = i;
+				break;
+			}
+		}
+
+		if (answerStart === -1) return output.trim();
+
+		const endIdx = citedStart !== -1 ? citedStart : lines.length;
+		const answerLines = lines.slice(answerStart, endIdx);
+
+		// Strip the "A: " prefix from the first line
+		if (answerLines.length > 0) {
+			answerLines[0] = answerLines[0].replace(/^A:\s*/, "");
+		}
+
+		let answer = answerLines.join("\n").trim();
+
+		// Append cited nodes if present
+		if (citedStart !== -1) {
+			const citedLines = lines.slice(citedStart).filter((l) => l.trim());
+			if (citedLines.length > 1) {
+				answer += "\n\n" + citedLines.join("\n");
+			}
+		}
+
+		return answer || output.trim();
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Settings Tab
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -286,6 +485,13 @@ export default class PageWikiPlugin extends Plugin {
 			callback: () => this.openAskModal(),
 		});
 
+		// Command: Chat (v0.6)
+		this.addCommand({
+			id: "pagewiki-chat",
+			name: "Chat (multi-turn conversation)",
+			callback: () => this.openChatModal(),
+		});
+
 		// Command: Compile LLM-Wiki
 		this.addCommand({
 			id: "pagewiki-compile",
@@ -344,6 +550,10 @@ export default class PageWikiPlugin extends Plugin {
 
 	private openAskModal(): void {
 		new AskModal(this.app, this.settings, (query) => this.runAsk(query)).open();
+	}
+
+	private openChatModal(): void {
+		new ChatModal(this.app, this.settings).open();
 	}
 
 	private async runAsk(query: string): Promise<void> {
