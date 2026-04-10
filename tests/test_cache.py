@@ -11,13 +11,12 @@ The cache must:
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 
 import pytest
 
-from pagewiki.cache import ADAPTER_VERSION, CACHE_DIR_NAME, TREES_SUBDIR, TreeCache
+from pagewiki.cache import CACHE_DIR_NAME, TREES_SUBDIR, TreeCache
 from pagewiki.tree import TreeNode
 
 

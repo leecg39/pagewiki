@@ -6,14 +6,14 @@ Mirrors the PageIndex node format but extends it with Obsidian-specific fields
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
-class NoteTier(str, Enum):
+class NoteTier(StrEnum):
     """3-tier classification from docs/ARCHITECTURE.md §3."""
 
     MICRO = "micro"  # < 500 tokens — title-only leaf

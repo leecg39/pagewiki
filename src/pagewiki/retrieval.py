@@ -28,7 +28,7 @@ from .prompts import (
     parse_select_response,
     select_node_prompt,
 )
-from .tree import NoteTier, TreeNode
+from .tree import TreeNode
 from .wiki_links import LinkIndex, build_link_index
 
 ChatFn = Callable[[str], str]
@@ -234,7 +234,7 @@ def run_retrieval(
         picked = next((c for c in candidates if c.node_id == value), None)
         if picked is None:
             trace.append(
-                TraceStep("select", value, f"invalid node_id (not in candidates)")
+                TraceStep("select", value, "invalid node_id (not in candidates)")
             )
             # Mark visited to avoid re-offering and retry the loop
             visited_ids.add(value)

@@ -22,18 +22,13 @@ from pathlib import Path
 
 import pytest
 
-from pagewiki._text import normalize_title
 from pagewiki.tree import NoteTier, TreeNode
 from pagewiki.vault import scan_folder
 from pagewiki.wiki_links import (
-    LinkIndex,
-    LinkIndexStats,
-    ResolvedLink,
     _apply_anchor_fallback,
     _extract_links_with_anchors,
     build_link_index,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Regex-level unit tests for the richer link parser
@@ -580,7 +575,7 @@ class TestLinkIndexStats:
         index = build_link_index(root)
         stats = index.stats()
 
-        top_titles = {title: count for title, count in stats.top_linked_to}
+        top_titles = dict(stats.top_linked_to)
 
         # Core assertion: both anchor links attribute to "paper", not
         # to "Methods" / "Results" section headings.

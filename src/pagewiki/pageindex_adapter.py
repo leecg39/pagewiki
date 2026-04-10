@@ -36,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from ._text import normalize_title as _normalize_title, titles_match as _titles_match
+from ._text import titles_match as _titles_match
 from ._vendor.pageindex import (
     build_tree_from_nodes,
     extract_node_text_content,
@@ -199,10 +199,7 @@ def _with_end_line(
     """
     result: list[tuple[dict, int]] = []
     for i, node in enumerate(nodes):
-        if i + 1 < len(nodes):
-            next_start = nodes[i + 1]["line_num"]
-        else:
-            next_start = total_lines + 1
+        next_start = nodes[i + 1]["line_num"] if i + 1 < len(nodes) else total_lines + 1
         result.append((node, next_start))
     return result
 

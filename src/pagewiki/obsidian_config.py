@@ -75,7 +75,7 @@ Runner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
 ConfigPathsProvider = Callable[[], list[Path]]
 
 
-def _default_runner(argv: list[str]) -> "subprocess.CompletedProcess[str]":
+def _default_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
     """Production subprocess runner. Short timeout, captured text output."""
     return subprocess.run(
         argv,

@@ -388,7 +388,7 @@ def compile(
         f"\n[bold green]LLM-Wiki compiled![/] "
         f"{len(generated)} pages written to {wiki_dir}"
     )
-    console.print(f"[dim]Open in Obsidian: index.md is the entry point.[/]")
+    console.print("[dim]Open in Obsidian: index.md is the entry point.[/]")
 
 
 @main.command()
@@ -414,7 +414,7 @@ def watch(vault: Path | None, folder: str | None, interval: int) -> None:
     whenever notes are added, modified, or deleted. Useful for keeping
     the PageIndex cache warm while editing in Obsidian.
     """
-    from .watcher import ChangeSet, detect_changes, save_state
+    from .watcher import detect_changes, save_state
 
     vault = _resolve_vault(vault)
     scope = f"{vault}{('/' + folder) if folder else ''}"
@@ -423,7 +423,7 @@ def watch(vault: Path | None, folder: str | None, interval: int) -> None:
 
     # Initial snapshot
     save_state(vault, folder)
-    console.print(f"[dim]Initial snapshot saved.[/]")
+    console.print("[dim]Initial snapshot saved.[/]")
 
     try:
         while True:

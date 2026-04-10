@@ -210,12 +210,14 @@ def build_long_subtrees(
         node_title = node.title
         node_prefix = node.node_id
 
-        def _build() -> list[TreeNode]:
+        def _build(
+            _path=node_path, _title=node_title, _prefix=node_prefix
+        ) -> list[TreeNode]:
             return build_long_note_subtree(
-                node_path,
-                node_title,
+                _path,
+                _title,
                 chat_fn=chat_fn,
-                node_id_prefix=node_prefix,
+                node_id_prefix=_prefix,
             )
 
         children, hit = cache.load_or_build(node.file_path, model_id, _build)

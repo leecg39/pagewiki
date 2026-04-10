@@ -24,7 +24,6 @@ from pagewiki.obsidian_config import (
     list_known_vaults,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,10 +33,10 @@ def _fake_runner(
     *,
     stdout: str = "",
     returncode: int = 0,
-) -> "callable":
+) -> callable:
     """Return a subprocess runner that always produces the given result."""
 
-    def _run(argv: list[str]) -> "subprocess.CompletedProcess[str]":
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(
             args=argv,
             returncode=returncode,
@@ -51,7 +50,7 @@ def _fake_runner(
 def _runner_raising(exc: Exception):
     """Return a runner that always raises the given exception."""
 
-    def _run(argv: list[str]) -> "subprocess.CompletedProcess[str]":
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         raise exc
 
     return _run
@@ -528,7 +527,7 @@ class TestStrategyOrder:
 class TestVaultInfo:
     def test_is_frozen(self) -> None:
         info = VaultInfo(name="x", path=Path("/tmp/x"))
-        with pytest.raises(Exception):
+        with pytest.raises(AttributeError):
             info.name = "y"  # type: ignore[misc]
 
     def test_default_is_default_false(self) -> None:
