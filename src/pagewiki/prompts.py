@@ -29,6 +29,8 @@ class NodeSummary:
     summary: str = ""
     token_count: int | None = None
     linked_from: str | None = None  # e.g. "intro.md → [[Q3 Revenue]]"
+    tags: list[str] | None = None  # frontmatter tags (v0.6)
+    date: str | None = None  # frontmatter date (v0.6)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,6 +75,10 @@ def select_node_prompt(
         meta = f"[{cand.kind}]"
         if cand.token_count is not None:
             meta += f" ~{cand.token_count}토큰"
+        if cand.tags:
+            meta += f" #{', #'.join(cand.tags)}"
+        if cand.date:
+            meta += f" ({cand.date})"
         if cand.linked_from:
             meta += f" [교차참조: {cand.linked_from}]"
         summary_part = f" — {cand.summary}" if cand.summary else ""
@@ -200,6 +206,75 @@ def atomic_summary_prompt(title: str, content: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Long-note section summarization (PageIndex sub-tree nodes)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversation context (v0.6 chat mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def rewrite_query_with_context(
+    new_query: str,
+    history: list[tuple[str, str]],
+) -> str:
+    """Build a prompt that rewrites a follow-up question into a standalone query.
+
+    The LLM sees the recent conversation history and the new message,
+    then produces a self-contained rephrasing. If the new query is
+    already standalone, the LLM returns it unchanged.
+
+    Args:
+        new_query: The latest user message.
+        history: List of (question, answer_summary) from previous turns.
+    """
+    lines = [
+        "당신은 질문 재작성 전문가입니다.",
+        "대화 맥락을 참고해 후속 질문을 독립적인 질문으로 재작성하세요.",
+        "이미 독립적인 질문이면 그대로 출력하세요.",
+        "재작성된 질문만 출력하고 다른 설명은 추가하지 마세요.",
+        "",
+        "[대화 이력]",
+    ]
+    for i, (q, a) in enumerate(history[-3:], start=1):  # last 3 turns max
+        lines.append(f"Q{i}: {q}")
+        lines.append(f"A{i}: {a[:200]}")
+    lines.append("")
+    lines.append(f"[새 질문]\n{new_query}")
+    lines.append("")
+    lines.append("재작성된 독립 질문:")
+    return "\n".join(lines)
+
+
+def final_answer_with_history_prompt(
+    query: str,
+    gathered_notes: list[tuple[str, str]],
+    history: list[tuple[str, str]],
+) -> str:
+    """Final answer prompt that includes conversation history for coherence.
+
+    Same as ``final_answer_prompt`` but prepends recent history so the
+    LLM can reference prior answers and avoid repetition.
+    """
+    lines = [_FINAL_ANSWER_SYSTEM, ""]
+
+    if history:
+        lines.append("[이전 대화]")
+        for i, (q, a) in enumerate(history[-3:], start=1):
+            lines.append(f"Q{i}: {q}")
+            lines.append(f"A{i}: {a[:300]}")
+        lines.append("")
+
+    lines.append(f"[사용자 질문]\n{query}")
+    lines.append("")
+    lines.append("[근거 노트]")
+    for idx, (title, content) in enumerate(gathered_notes, start=1):
+        lines.append(f"\n--- 노트 {idx}: {title} ---\n{content[:8000]}")
+    lines.append("")
+    lines.append(
+        "위 근거와 이전 대화 맥락을 바탕으로 질문에 한국어로 답변하세요. "
+        "답변 끝에 참조한 노트 제목을 [[제목]] 형식으로 나열하세요."
+    )
+    return "\n".join(lines)
 
 
 def section_summary_prompt(note_title: str, section_title: str, section_text: str) -> str:

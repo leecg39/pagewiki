@@ -39,6 +39,11 @@ class TreeNode(BaseModel):
     token_count: int | None = None
     wiki_links: list[str] = Field(default_factory=list)
 
+    # Frontmatter metadata (v0.6)
+    tags: list[str] = Field(default_factory=list)
+    date: str | None = None
+    aliases: list[str] = Field(default_factory=list)
+
     # PageIndex-compatible (Layer 2)
     # For PDF sources: (start_page, end_page). Unused in markdown mode.
     page_range: tuple[int, int] | None = None

@@ -177,3 +177,75 @@ class TreeCache:
         built = builder()
         self.save(note_path, model_id, built)
         return built, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Atomic summary cache (v0.6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SUMMARIES_SUBDIR = "summaries"
+
+
+class SummaryCache:
+    """On-disk cache for one-line atomic-note summaries.
+
+    Follows the same invalidation-key pattern as ``TreeCache``:
+    ``(abs_path, mtime_ns, model_id)`` must all match for a cache hit.
+    One JSON file per note, keyed by SHA-1 of the absolute path.
+    """
+
+    def __init__(self, vault_root: Path) -> None:
+        self.root = Path(vault_root).resolve() / CACHE_DIR_NAME / SUMMARIES_SUBDIR
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def _file_for(self, note_path: Path) -> Path:
+        abs_str = str(Path(note_path).resolve())
+        digest = hashlib.sha1(abs_str.encode("utf-8")).hexdigest()
+        return self.root / f"{digest}.json"
+
+    def load(self, note_path: Path, model_id: str) -> str | None:
+        """Return the cached summary string if still valid, else ``None``."""
+        cache_file = self._file_for(note_path)
+        if not cache_file.exists():
+            return None
+
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        stored_key = payload.get("key", {})
+        try:
+            current_mtime = Path(note_path).stat().st_mtime_ns
+        except OSError:
+            return None
+
+        if (
+            stored_key.get("abs_path") != str(Path(note_path).resolve())
+            or stored_key.get("mtime_ns") != current_mtime
+            or stored_key.get("model_id") != model_id
+        ):
+            return None
+
+        return payload.get("summary")
+
+    def save(self, note_path: Path, model_id: str, summary: str) -> None:
+        """Persist the summary string for ``note_path``."""
+        try:
+            mtime = Path(note_path).stat().st_mtime_ns
+        except OSError:
+            return
+
+        payload = {
+            "key": {
+                "abs_path": str(Path(note_path).resolve()),
+                "mtime_ns": mtime,
+                "model_id": model_id,
+            },
+            "summary": summary,
+        }
+        cache_file = self._file_for(note_path)
+        cache_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

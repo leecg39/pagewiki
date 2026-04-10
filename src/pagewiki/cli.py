@@ -14,14 +14,15 @@ from pathlib import Path
 import click
 from rich.console import Console
 from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
 
 from . import __version__
-from .cache import TreeCache
+from .cache import SummaryCache, TreeCache
 from .logger import QueryRecord, write_log
 from .retrieval import run_retrieval
 from .tree import NoteTier
-from .vault import build_long_subtrees, scan_folder, summarize_atomic_notes
+from .vault import build_long_subtrees, filter_tree, scan_folder, summarize_atomic_notes
 
 console = Console()
 
@@ -571,6 +572,24 @@ def watch(
     is_flag=True,
     help="Open cited notes in the editor via notesmd-cli (instead of just printing hints).",
 )
+@click.option(
+    "--tag",
+    "filter_tags",
+    multiple=True,
+    help="Only consider notes with this tag (repeatable). E.g. --tag research --tag ml",
+)
+@click.option(
+    "--after",
+    "filter_after",
+    default=None,
+    help="Only consider notes with date >= this value. E.g. --after 2024-01",
+)
+@click.option(
+    "--before",
+    "filter_before",
+    default=None,
+    help="Only consider notes with date <= this value. E.g. --before 2025-06",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -579,6 +598,9 @@ def ask(
     num_ctx: int,
     skip_summaries: bool,
     open_cited: bool,
+    filter_tags: tuple[str, ...],
+    filter_after: str | None,
+    filter_before: str | None,
 ) -> None:
     """Run a multi-hop reasoning query against a vault folder."""
     vault = _resolve_vault(vault)
@@ -591,6 +613,22 @@ def ask(
     # Step 1: scan
     console.print("[dim]1/4 Scanning vault...[/]")
     root = scan_folder(vault, folder)
+
+    # Apply frontmatter filters (v0.6).
+    active_filters = list(filter_tags) or None
+    if active_filters or filter_after or filter_before:
+        root = filter_tree(
+            root, tags=active_filters, after=filter_after, before=filter_before,
+        )
+        filter_desc = []
+        if active_filters:
+            filter_desc.append(f"tags={active_filters}")
+        if filter_after:
+            filter_desc.append(f"after={filter_after}")
+        if filter_before:
+            filter_desc.append(f"before={filter_before}")
+        console.print(f"[dim]    filter: {', '.join(filter_desc)}[/]")
+
     note_count = sum(1 for n in root.walk() if n.kind == "note")
     long_count = sum(
         1 for n in root.walk() if n.kind == "note" and n.tier == NoteTier.LONG
@@ -600,11 +638,14 @@ def ask(
         console.print(f"[red]No notes found in {vault / folder}[/]")
         sys.exit(1)
 
-    # Step 2: summarize atomic notes (optional)
+    # Step 2: summarize atomic notes (optional, with on-disk cache)
     if not skip_summaries:
         console.print("[dim]2/4 Summarizing atomic notes...[/]")
-        summarized = summarize_atomic_notes(root, chat_fn)
-        console.print(f"[dim]    → {summarized} notes summarized[/]")
+        scache = SummaryCache(vault)
+        summarized = summarize_atomic_notes(
+            root, chat_fn, summary_cache=scache, model_id=model,
+        )
+        console.print(f"[dim]    → {summarized} notes summarized (rest from cache)[/]")
     else:
         console.print("[dim]2/4 Skipping summarization (--skip-summaries)[/]")
 
@@ -630,13 +671,30 @@ def ask(
 
     link_index = build_link_index(root)
 
-    # Step 4: retrieval loop
+    # Step 4: retrieval loop with live streaming (v0.6)
     console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
-    result = run_retrieval(query, root, chat_fn, link_index=link_index)
+
+    from .retrieval import TraceStep
+
+    _phase_icons = {
+        "select": "[cyan]SELECT[/]",
+        "evaluate": "[yellow]EVAL[/]",
+        "cross-ref": "[magenta]XREF[/]",
+        "finalize": "[green]DONE[/]",
+    }
+
+    def _on_event(step: TraceStep) -> None:
+        icon = _phase_icons.get(step.phase, step.phase)
+        node_part = f" [{escape(step.node_id)}]" if step.node_id else ""
+        console.print(f"  {icon}{node_part} {escape(step.detail)}")
+
+    result = run_retrieval(
+        query, root, chat_fn, link_index=link_index, on_event=_on_event,
+    )
 
     elapsed = time.time() - start
 
-    console.print(f"[bold green]A:[/] {result.answer}\n")
+    console.print(f"\n[bold green]A:[/] {result.answer}\n")
 
     if result.cited_nodes:
         console.print("[bold]Cited nodes:[/]")
@@ -661,6 +719,180 @@ def ask(
     )
     log_path = write_log(vault / folder, record)
     console.print(f"[dim]Logged to {log_path}[/]")
+
+
+@main.command()
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root.",
+)
+@click.option(
+    "--folder", default="Research", help="Subfolder inside the vault. Default: Research",
+)
+@click.option("--model", default="ollama/gemma4:26b", help="LiteLLM model id.")
+@click.option("--num-ctx", default=131072, type=int, help="Ollama context window.")
+@click.option(
+    "--skip-summaries", is_flag=True, help="Skip atomic-note summarization.",
+)
+@click.option(
+    "--tag",
+    "filter_tags",
+    multiple=True,
+    help="Only consider notes with this tag (repeatable).",
+)
+@click.option("--after", "filter_after", default=None, help="Notes with date >= value.")
+@click.option("--before", "filter_before", default=None, help="Notes with date <= value.")
+def chat(
+    vault: Path | None,
+    folder: str,
+    model: str,
+    num_ctx: int,
+    skip_summaries: bool,
+    filter_tags: tuple[str, ...],
+    filter_after: str | None,
+    filter_before: str | None,
+) -> None:
+    """Interactive multi-turn conversation against a vault folder.
+
+    Maintains conversation history so follow-up questions build on
+    previous answers. Type 'quit' or 'exit' to stop, '/clear' to
+    reset the conversation.
+    """
+    from .prompts import rewrite_query_with_context
+    from .retrieval import TraceStep as _TraceStep
+    from .wiki_links import build_link_index
+
+    vault = _resolve_vault(vault)
+    console.print(
+        Panel(
+            f"[bold cyan]pagewiki chat[/] — interactive mode\n"
+            f"vault={vault}  folder={folder}  model={model}\n"
+            f"Type [bold]quit[/] to exit, [bold]/clear[/] to reset history.",
+            title="pagewiki v0.6",
+        )
+    )
+
+    chat_fn = _make_chat_fn(model, num_ctx)
+
+    # Pre-scan once so repeated queries reuse the same tree.
+    console.print("[dim]Scanning vault...[/]")
+    root = scan_folder(vault, folder)
+
+    # Apply filters.
+    active_filters = list(filter_tags) or None
+    if active_filters or filter_after or filter_before:
+        root = filter_tree(
+            root, tags=active_filters, after=filter_after, before=filter_before,
+        )
+
+    note_count = sum(1 for n in root.walk() if n.kind == "note")
+    if note_count == 0:
+        console.print(f"[red]No notes found in {vault / folder}[/]")
+        sys.exit(1)
+
+    # Summarize atomic notes (cached).
+    if not skip_summaries:
+        console.print("[dim]Summarizing atomic notes...[/]")
+        scache = SummaryCache(vault)
+        summarized = summarize_atomic_notes(
+            root, chat_fn, summary_cache=scache, model_id=model,
+        )
+        console.print(f"[dim]  → {summarized} summarized (rest from cache)[/]")
+
+    # Build Layer 2 sub-trees.
+    long_count = sum(
+        1 for n in root.walk() if n.kind == "note" and n.tier == NoteTier.LONG
+    )
+    if long_count > 0:
+        console.print(f"[dim]Building sub-trees for {long_count} LONG notes...[/]")
+        section_chat_fn = None if skip_summaries else chat_fn
+        built, from_cache = build_long_subtrees(
+            root, vault_root=vault, model_id=model,
+            chat_fn=section_chat_fn, cache=TreeCache(vault),
+        )
+        console.print(f"[dim]  → {built} built, {from_cache} from cache[/]")
+
+    link_index = build_link_index(root)
+    console.print(f"[dim]Ready! {note_count} notes loaded.[/]\n")
+
+    # Conversation state.
+    history: list[tuple[str, str]] = []
+
+    _phase_icons = {
+        "select": "[cyan]SELECT[/]",
+        "evaluate": "[yellow]EVAL[/]",
+        "cross-ref": "[magenta]XREF[/]",
+        "finalize": "[green]DONE[/]",
+    }
+
+    def _on_event(step: _TraceStep) -> None:
+        icon = _phase_icons.get(step.phase, step.phase)
+        node_part = f" [{escape(step.node_id)}]" if step.node_id else ""
+        console.print(f"  {icon}{node_part} {escape(step.detail)}")
+
+    turn = 0
+    while True:
+        try:
+            raw = console.input("[bold cyan]Q:[/] ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Bye![/]")
+            break
+
+        query = raw.strip()
+        if not query:
+            continue
+        if query.lower() in ("quit", "exit"):
+            console.print("[dim]Bye![/]")
+            break
+        if query == "/clear":
+            history.clear()
+            console.print("[dim]Conversation history cleared.[/]\n")
+            continue
+
+        turn += 1
+        start = time.time()
+
+        # Rewrite follow-up queries into standalone form.
+        effective_query = query
+        if history:
+            rewritten = chat_fn(rewrite_query_with_context(query, history)).strip()
+            if rewritten and rewritten != query:
+                console.print(f"[dim]  → rewritten: {rewritten}[/]")
+                effective_query = rewritten
+
+        result = run_retrieval(
+            effective_query, root, chat_fn,
+            link_index=link_index, on_event=_on_event, history=history,
+        )
+
+        elapsed = time.time() - start
+
+        console.print(f"\n[bold green]A:[/] {result.answer}\n")
+
+        if result.cited_nodes:
+            console.print("[bold]Cited:[/]")
+            for cited in result.cited_nodes:
+                console.print(f"  • {cited}")
+
+        console.print(
+            f"[dim]turn={turn}  iterations={result.iterations_used}  "
+            f"elapsed={elapsed:.1f}s[/]\n"
+        )
+
+        # Append to conversation history.
+        history.append((query, result.answer[:500]))
+
+        # Log each turn.
+        record = QueryRecord(
+            query=query,
+            answer=result.answer,
+            cited_nodes=result.cited_nodes,
+            model=model,
+            elapsed_seconds=elapsed,
+        )
+        write_log(vault / folder, record)
 
 
 if __name__ == "__main__":
