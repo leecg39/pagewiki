@@ -29,6 +29,7 @@ from .prompts import (
     select_node_prompt,
 )
 from .tree import NoteTier, TreeNode
+from .wiki_links import LinkIndex, build_link_index
 
 ChatFn = Callable[[str], str]
 
@@ -57,18 +58,43 @@ class RetrievalResult:
     iterations_used: int = 0
 
 
+def _node_as_summary(
+    node: TreeNode,
+    *,
+    linked_from: str | None = None,
+) -> NodeSummary:
+    """Project a single TreeNode into the prompt-friendly NodeSummary shape."""
+    return NodeSummary(
+        node_id=node.node_id,
+        title=node.title,
+        kind=node.kind,
+        summary=node.summary,
+        token_count=node.token_count,
+        linked_from=linked_from,
+    )
+
+
 def _children_as_summaries(node: TreeNode) -> list[NodeSummary]:
     """Project TreeNode children into the prompt-friendly NodeSummary shape."""
-    return [
-        NodeSummary(
-            node_id=child.node_id,
-            title=child.title,
-            kind=child.kind,
-            summary=child.summary,
-            token_count=child.token_count,
-        )
-        for child in node.children
-    ]
+    return [_node_as_summary(child) for child in node.children]
+
+
+def _promote_to_note(node: TreeNode, root: TreeNode) -> TreeNode:
+    """If ``node`` is a section, walk up to its enclosing note.
+
+    Section node_ids follow the ``<rel_path>#<id>`` convention set by
+    ``pageindex_adapter``, so splitting on ``#`` gives the note's
+    node_id. Returns ``node`` itself if it's already a note (or if the
+    enclosing note can't be found).
+    """
+    if node.kind != "section":
+        return node
+    if "#" in node.node_id:
+        note_id = node.node_id.rsplit("#", 1)[0]
+        found = root.find(note_id)
+        if found is not None:
+            return found
+    return node
 
 
 def _load_note_content(node: TreeNode) -> str:
@@ -107,6 +133,7 @@ def run_retrieval(
     *,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     max_gathered: int = DEFAULT_MAX_GATHERED_NOTES,
+    link_index: LinkIndex | None = None,
 ) -> RetrievalResult:
     """Run the multi-hop reasoning loop.
 
@@ -118,6 +145,10 @@ def run_retrieval(
             tests inject a fake that returns scripted responses.
         max_iterations: Safety cap on total select→evaluate cycles.
         max_gathered: Stop exploring once this many notes have been collected.
+        link_index: Pre-built wiki-link index. If ``None``, one is built
+            automatically from ``root``. Pass a pre-built index to avoid
+            redundant I/O when the caller (e.g. ``cli.ask``) has already
+            built one.
 
     Returns:
         RetrievalResult with answer, cited node ids, and reasoning trace.
@@ -128,6 +159,15 @@ def run_retrieval(
     visited_ids: set[str] = set()
     path_so_far: list[str] = []
 
+    # Build the wiki-link index for cross-reference traversal (v0.2).
+    if link_index is None:
+        link_index = build_link_index(root)
+
+    # Cross-reference pool: wiki-link targets discovered during
+    # the loop that are outside the current cursor's subtree.
+    # Maps node_id → (TreeNode, linked_from_label).
+    cross_ref_pool: dict[str, tuple[TreeNode, str]] = {}
+
     # Cursor into the tree. Starts at root; moves down as folders are selected.
     cursor: TreeNode = root
 
@@ -137,12 +177,24 @@ def run_retrieval(
     while iteration < max_iterations and len(gathered) < max_gathered:
         iteration += 1
 
-        candidates = [
+        tree_candidates = [
             child for child in cursor.children if child.node_id not in visited_ids
         ]
+
+        # Merge wiki-link cross-reference candidates that are not
+        # already present as tree children under the current cursor.
+        tree_ids = {c.node_id for c in tree_candidates}
+        xref_candidates: list[tuple[TreeNode, str]] = [
+            (node, label)
+            for nid, (node, label) in cross_ref_pool.items()
+            if nid not in visited_ids and nid not in tree_ids
+        ]
+
+        candidates = tree_candidates + [node for node, _ in xref_candidates]
+
         if not candidates:
             # Nothing left to look at under this cursor — bubble up
-            if cursor is root:
+            if cursor is root and not xref_candidates:
                 done_reason = "모든 후보 노드를 탐색 완료"
                 break
             # Walk back up by searching for the parent. The simple approach:
@@ -151,16 +203,17 @@ def run_retrieval(
             path_so_far = []
             continue
 
-        # Phase 1+2: present candidates and ask the LLM to pick one
-        cursor_view = TreeNode(
-            node_id=cursor.node_id,
-            title=cursor.title,
-            kind=cursor.kind,
-            children=candidates,
-        )
+        # Phase 1+2: present candidates and ask the LLM to pick one.
+        # Build NodeSummary list with cross-ref annotations.
+        summaries: list[NodeSummary] = [
+            _node_as_summary(child) for child in tree_candidates
+        ]
+        for node, label in xref_candidates:
+            summaries.append(_node_as_summary(node, linked_from=label))
+
         prompt = select_node_prompt(
             query,
-            _children_as_summaries(cursor_view),
+            summaries,
             path_so_far=path_so_far or None,
         )
         response = chat_fn(prompt)
@@ -188,7 +241,21 @@ def run_retrieval(
             continue
 
         visited_ids.add(picked.node_id)
-        trace.append(TraceStep("select", picked.node_id, f"picked {picked.title}"))
+        is_xref = value in cross_ref_pool
+        trace.append(
+            TraceStep(
+                "select",
+                picked.node_id,
+                f"picked {picked.title}"
+                + (" (cross-ref)" if is_xref else ""),
+            )
+        )
+
+        # If following a cross-ref that lives outside the current
+        # cursor's subtree, reset the cursor so descend logic works.
+        if is_xref:
+            cursor = root
+            path_so_far = []
 
         if picked.kind == "folder":
             # Descend into subfolder — next iteration runs ToC Review on it
@@ -230,6 +297,28 @@ def run_retrieval(
                 f"{'SUFFICIENT' if sufficient else 'INSUFFICIENT'}: {reason}",
             )
         )
+
+        # v0.2: after evaluating a note, enqueue its outgoing wiki-link
+        # targets as cross-reference candidates for future iterations.
+        # Section targets are promoted to their enclosing note so the
+        # normal descend logic applies.
+        source_note_id = (
+            picked.node_id.rsplit("#", 1)[0]
+            if "#" in picked.node_id
+            else picked.node_id
+        )
+        for link in link_index.outgoing(source_note_id):
+            target = _promote_to_note(link.target, root)
+            if target.node_id not in visited_ids and target.node_id not in cross_ref_pool:
+                label = f"{Path(source_note_id).stem} → [[{link.raw_target}]]"
+                cross_ref_pool[target.node_id] = (target, label)
+                trace.append(
+                    TraceStep(
+                        "cross-ref",
+                        target.node_id,
+                        f"enqueued from {source_note_id} via [[{link.raw_target}]]",
+                    )
+                )
 
         if sufficient:
             done_reason = reason

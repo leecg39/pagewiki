@@ -28,6 +28,7 @@ class NodeSummary:
     kind: str  # folder | note | section
     summary: str = ""
     token_count: int | None = None
+    linked_from: str | None = None  # e.g. "intro.md → [[Q3 Revenue]]"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,6 +73,8 @@ def select_node_prompt(
         meta = f"[{cand.kind}]"
         if cand.token_count is not None:
             meta += f" ~{cand.token_count}토큰"
+        if cand.linked_from:
+            meta += f" [교차참조: {cand.linked_from}]"
         summary_part = f" — {cand.summary}" if cand.summary else ""
         lines.append(f"{idx}. {meta} {cand.title}{summary_part}")
         lines.append(f"   node_id: {cand.node_id}")

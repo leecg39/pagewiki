@@ -1,0 +1,19 @@
+{
+	"name": "obsidian-pagewiki",
+	"version": "0.5.0",
+	"description": "Obsidian plugin for pagewiki — vectorless RAG",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+	},
+	"keywords": ["obsidian", "rag", "pagewiki", "pageindex"],
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"builtin-modules": "^3.3.0",
+		"esbuild": "^0.21.0",
+		"obsidian": "latest",
+		"typescript": "^5.4.0"
+	}
+}

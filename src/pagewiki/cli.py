@@ -336,6 +336,119 @@ def vaults() -> None:
 
 
 @main.command()
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root. If omitted, auto-discovered.",
+)
+@click.option(
+    "--folder", default=None, help="Subfolder inside the vault (e.g. Research)."
+)
+@click.option(
+    "--model", default="ollama/gemma4:26b", help="LiteLLM model id."
+)
+@click.option(
+    "--num-ctx", default=131072, type=int, help="Ollama context window."
+)
+def compile(
+    vault: Path | None,
+    folder: str | None,
+    model: str,
+    num_ctx: int,
+) -> None:
+    """Compile vault notes into an LLM-Wiki (entity pages + index).
+
+    Extracts entities from every note, generates cross-referenced wiki
+    pages, and writes them to ``{vault}/LLM-Wiki/``. Follows Karpathy's
+    LLM-Wiki pattern: raw sources → entity extraction → wiki compilation.
+    """
+    from .compile import compile_wiki
+
+    vault = _resolve_vault(vault)
+    console.print(
+        f"[bold cyan]Compiling LLM-Wiki[/] from "
+        f"{vault}{('/' + folder) if folder else ''}"
+    )
+
+    root = scan_folder(vault, folder)
+    note_count = sum(1 for n in root.walk() if n.kind == "note")
+    if note_count == 0:
+        console.print("[red]No notes found to compile.[/]")
+        sys.exit(1)
+
+    console.print(f"[dim]Found {note_count} notes to process...[/]")
+
+    chat_fn = _make_chat_fn(model, num_ctx)
+    wiki_dir = compile_wiki(root, vault, chat_fn, subfolder=folder)
+
+    # Count generated files
+    generated = list(wiki_dir.glob("*.md"))
+    console.print(
+        f"\n[bold green]LLM-Wiki compiled![/] "
+        f"{len(generated)} pages written to {wiki_dir}"
+    )
+    console.print(f"[dim]Open in Obsidian: index.md is the entry point.[/]")
+
+
+@main.command()
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root. If omitted, auto-discovered.",
+)
+@click.option(
+    "--folder", default=None, help="Subfolder inside the vault (e.g. Research)."
+)
+@click.option(
+    "--interval",
+    default=10,
+    type=int,
+    help="Poll interval in seconds. Default: 10.",
+)
+def watch(vault: Path | None, folder: str | None, interval: int) -> None:
+    """Watch the vault for file changes and report them in real time.
+
+    Polls the vault directory at the given interval and prints a summary
+    whenever notes are added, modified, or deleted. Useful for keeping
+    the PageIndex cache warm while editing in Obsidian.
+    """
+    from .watcher import ChangeSet, detect_changes, save_state
+
+    vault = _resolve_vault(vault)
+    scope = f"{vault}{('/' + folder) if folder else ''}"
+    console.print(f"[bold cyan]Watching[/] {scope} (poll every {interval}s)")
+    console.print("[dim]Press Ctrl+C to stop.[/]\n")
+
+    # Initial snapshot
+    save_state(vault, folder)
+    console.print(f"[dim]Initial snapshot saved.[/]")
+
+    try:
+        while True:
+            import time as _time
+
+            _time.sleep(interval)
+            changes = detect_changes(vault, folder)
+            if changes.has_changes:
+                save_state(vault, folder)
+                ts = __import__("datetime").datetime.now().strftime("%H:%M:%S")
+                console.print(f"\n[bold yellow][{ts}] Changes detected:[/]")
+                for path in changes.added:
+                    console.print(f"  [green]+[/] {path}")
+                for path in changes.modified:
+                    console.print(f"  [yellow]~[/] {path}")
+                for path in changes.deleted:
+                    console.print(f"  [red]-[/] {path}")
+                console.print(
+                    f"[dim]  Total: {changes.total} change(s)[/]"
+                )
+    except KeyboardInterrupt:
+        console.print("\n[dim]Watch stopped.[/]")
+
+
+@main.command()
 @click.argument("query")
 @click.option(
     "--vault",
@@ -411,9 +524,14 @@ def ask(
     else:
         console.print("[dim]3/4 No LONG notes — skipping sub-tree build[/]")
 
+    # Step 3.5: build wiki-link index for cross-reference traversal (v0.2)
+    from .wiki_links import build_link_index
+
+    link_index = build_link_index(root)
+
     # Step 4: retrieval loop
     console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
-    result = run_retrieval(query, root, chat_fn)
+    result = run_retrieval(query, root, chat_fn, link_index=link_index)
 
     elapsed = time.time() - start
 
