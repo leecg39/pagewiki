@@ -392,6 +392,63 @@ def compile(
 
 
 @main.command()
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root. If omitted, auto-discovered.",
+)
+@click.option(
+    "--folder", default=None, help="Subfolder inside the vault (e.g. Research)."
+)
+@click.option(
+    "--interval",
+    default=10,
+    type=int,
+    help="Poll interval in seconds. Default: 10.",
+)
+def watch(vault: Path | None, folder: str | None, interval: int) -> None:
+    """Watch the vault for file changes and report them in real time.
+
+    Polls the vault directory at the given interval and prints a summary
+    whenever notes are added, modified, or deleted. Useful for keeping
+    the PageIndex cache warm while editing in Obsidian.
+    """
+    from .watcher import ChangeSet, detect_changes, save_state
+
+    vault = _resolve_vault(vault)
+    scope = f"{vault}{('/' + folder) if folder else ''}"
+    console.print(f"[bold cyan]Watching[/] {scope} (poll every {interval}s)")
+    console.print("[dim]Press Ctrl+C to stop.[/]\n")
+
+    # Initial snapshot
+    save_state(vault, folder)
+    console.print(f"[dim]Initial snapshot saved.[/]")
+
+    try:
+        while True:
+            import time as _time
+
+            _time.sleep(interval)
+            changes = detect_changes(vault, folder)
+            if changes.has_changes:
+                save_state(vault, folder)
+                ts = __import__("datetime").datetime.now().strftime("%H:%M:%S")
+                console.print(f"\n[bold yellow][{ts}] Changes detected:[/]")
+                for path in changes.added:
+                    console.print(f"  [green]+[/] {path}")
+                for path in changes.modified:
+                    console.print(f"  [yellow]~[/] {path}")
+                for path in changes.deleted:
+                    console.print(f"  [red]-[/] {path}")
+                console.print(
+                    f"[dim]  Total: {changes.total} change(s)[/]"
+                )
+    except KeyboardInterrupt:
+        console.print("\n[dim]Watch stopped.[/]")
+
+
+@main.command()
 @click.argument("query")
 @click.option(
     "--vault",
