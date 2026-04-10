@@ -406,12 +406,49 @@ export default class PageWikiPlugin extends Plugin {
 		}
 	}
 
-	private startWatch(): void {
+	/** Build the env dict used by watch commands — passes vault/folder
+	 *  via environment variables so special characters (apostrophes,
+	 *  spaces, backslashes) never break the embedded Python string. */
+	private _watchEnv(): Record<string, string> {
+		const vaultPath = (this.app.vault.adapter as any).basePath as string;
+		return {
+			...process.env as Record<string, string>,
+			NO_COLOR: "1",
+			PAGEWIKI_VAULT: vaultPath,
+			PAGEWIKI_FOLDER: this.settings.folder || "",
+		};
+	}
+
+	/** Seed ``scan-state.json`` so the first poll only reports real deltas. */
+	private _seedSnapshot(): Promise<void> {
+		const cmd =
+			`${this.settings.pythonPath} -c "` +
+			`import os; from pathlib import Path; ` +
+			`from pagewiki.watcher import save_state; ` +
+			`save_state(Path(os.environ['PAGEWIKI_VAULT']), os.environ.get('PAGEWIKI_FOLDER') or None)"`;
+
+		return new Promise((resolve, reject) => {
+			exec(
+				cmd,
+				{ timeout: 30_000, env: this._watchEnv() },
+				(error, _stdout, stderr) => {
+					if (error) reject(new Error(stderr || error.message));
+					else resolve();
+				},
+			);
+		});
+	}
+
+	private async startWatch(): Promise<void> {
 		if (this.watchInterval) return;
 
-		// Save initial state
-		runPagewiki(this.app, this.settings, `scan --folder "${this.settings.folder}"`)
-			.catch(() => {});
+		// Seed the mtime snapshot before polling so the first cycle
+		// only reports actual deltas, not the entire vault as "added".
+		try {
+			await this._seedSnapshot();
+		} catch {
+			new Notice("PageWiki: failed to seed watch snapshot", 5000);
+		}
 
 		if (this.statusBarEl) {
 			this.statusBarEl.setText("PageWiki: watching");
@@ -420,18 +457,20 @@ export default class PageWikiPlugin extends Plugin {
 
 		this.watchInterval = setInterval(async () => {
 			try {
-				const vaultPath = (this.app.vault.adapter as any).basePath as string;
 				const cmd =
 					`${this.settings.pythonPath} -c "` +
+					`import os; from pathlib import Path; ` +
 					`from pagewiki.watcher import detect_changes, save_state; ` +
-					`cs = detect_changes(r'${vaultPath}', '${this.settings.folder}'); ` +
+					`v = Path(os.environ['PAGEWIKI_VAULT']); ` +
+					`f = os.environ.get('PAGEWIKI_FOLDER') or None; ` +
+					`cs = detect_changes(v, f); ` +
 					`print(f'{len(cs.added)}|{len(cs.modified)}|{len(cs.deleted)}'); ` +
-					`save_state(r'${vaultPath}', '${this.settings.folder}') if cs.has_changes else None"`;
+					`save_state(v, f) if cs.has_changes else None"`;
 
 				const output = await new Promise<string>((resolve, reject) => {
 					exec(
 						cmd,
-						{ timeout: 15_000, env: { ...process.env, NO_COLOR: "1" } },
+						{ timeout: 15_000, env: this._watchEnv() },
 						(error, stdout, stderr) => {
 							if (error) reject(new Error(stderr || error.message));
 							else resolve(stdout.trim());
