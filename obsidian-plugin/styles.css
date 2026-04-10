@@ -1,0 +1,9 @@
+/* PageWiki Obsidian Plugin styles */
+
+.pagewiki-result {
+	background-color: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	padding: 12px 16px;
+	font-family: var(--font-monospace);
+}

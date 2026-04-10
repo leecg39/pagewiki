@@ -111,8 +111,27 @@ pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
 - v0.1.5: notesmd-cli 통합 — `--vault` auto-discovery, `pagewiki vaults` 서브커맨드, `ask` citation을 `notesmd-cli open` 힌트로 표시
 - v0.2: `[[wiki-link]]` retrieval traversal — 노트 평가 후 outgoing wiki-link를 교차참조 후보로 자동 추가, transitive chain following
 - v0.3: Karpathy LLM-Wiki compiler — `pagewiki compile`로 entity 추출 → 위키 페이지 자동 생성 → `{vault}/LLM-Wiki/`에 교차참조된 위키 출력
-- **v0.4 (현재)**: 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 파일 변경 실시간 감지
-- **v0.5**: Obsidian 플러그인 UI
+- v0.4: 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 파일 변경 실시간 감지
+- **v0.5 (현재)**: Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile 실행, Settings 탭, 결과 모달
+
+## Obsidian 플러그인 (v0.5)
+
+터미널 없이 Obsidian 안에서 직접 pagewiki를 사용할 수 있습니다.
+
+```bash
+cd obsidian-plugin
+npm install && npm run build
+# main.js, manifest.json, styles.css를
+# {vault}/.obsidian/plugins/pagewiki/ 에 복사
+```
+
+Command Palette (`Cmd/Ctrl + P`)에서:
+- **PageWiki: Scan vault** — 3-tier 분류 + wiki-link 그래프
+- **PageWiki: Ask a question** — 질문 입력 → 답변 모달
+- **PageWiki: Compile LLM-Wiki** — entity 추출 → 위키 생성
+- **PageWiki: List discovered vaults** — 감지된 볼트 목록
+
+Settings 탭에서 Python 경로, 모델, 기본 폴더 설정 가능.
 
 로컬 머신에서 Ollama + Gemma 4로 실제 품질/성능을 검증하려면
 [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) 참고.
