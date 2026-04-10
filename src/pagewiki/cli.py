@@ -411,9 +411,14 @@ def ask(
     else:
         console.print("[dim]3/4 No LONG notes — skipping sub-tree build[/]")
 
+    # Step 3.5: build wiki-link index for cross-reference traversal (v0.2)
+    from .wiki_links import build_link_index
+
+    link_index = build_link_index(root)
+
     # Step 4: retrieval loop
     console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
-    result = run_retrieval(query, root, chat_fn)
+    result = run_retrieval(query, root, chat_fn, link_index=link_index)
 
     elapsed = time.time() - start
 

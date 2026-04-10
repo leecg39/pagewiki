@@ -102,8 +102,8 @@ pagewiki ask "2024년 3분기 매출 관련 리서치 요약" \
 - v0.1.2: PageIndex 실제 통합 — LONG 노트의 섹션 트리 빌드 + 디스크 캐시 + 섹션 단위 descend
 - v0.1.3: h1-title flatten + `(intro)` 보존 / vault-relative section id / local validation scripts
 - v0.1.4: `[[wiki-link]]` resolution index + `scan --show-graph` (PR #2)
-- **v0.1.5 (현재)**: notesmd-cli 통합 — `--vault` auto-discovery, `pagewiki vaults` 서브커맨드, `ask` citation을 `notesmd-cli open` 힌트로 표시
-- **v0.2**: `[[wiki-link]]` retrieval traversal (다음 마일스톤)
+- v0.1.5: notesmd-cli 통합 — `--vault` auto-discovery, `pagewiki vaults` 서브커맨드, `ask` citation을 `notesmd-cli open` 힌트로 표시
+- **v0.2 (현재)**: `[[wiki-link]]` retrieval traversal — 노트 평가 후 outgoing wiki-link를 교차참조 후보로 자동 추가, transitive chain following
 - **v0.3**: Karpathy LLM-Wiki compiler 통합
 - **v0.4**: 증분 재인덱싱 + 파일 watcher
 - **v0.5**: Obsidian 플러그인 UI

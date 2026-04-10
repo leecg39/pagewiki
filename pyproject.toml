@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pagewiki"
-version = "0.1.5"
+version = "0.2.0"
 description = "Vectorless reasoning-based RAG for Obsidian vaults, powered by local Gemma 4"
 readme = "README.md"
 license = { text = "MIT" }
