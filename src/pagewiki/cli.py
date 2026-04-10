@@ -143,6 +143,57 @@ def _print_notesmd_open_hints(
         console.print(f"  {shlex.join(argv)}")
 
 
+def _open_cited_notes(
+    cited_node_ids: list[str], root, *, vault: Path
+) -> None:
+    """Actually spawn ``notesmd-cli open`` for each cited note.
+
+    Unlike ``_print_notesmd_open_hints`` which only prints copy-paste
+    commands, this function executes them via subprocess so the user's
+    editor opens each cited section directly.
+    """
+    import shlex
+    import subprocess
+
+    from .obsidian_config import _notesmd_cli_on_path, build_open_command
+
+    if not _notesmd_cli_on_path():
+        console.print(
+            "[yellow]notesmd-cli is not on PATH — cannot open notes. "
+            "Install it or use hints without --open.[/]"
+        )
+        return
+
+    vault_name = _resolve_vault_name_for_hints(vault)
+    by_id = {n.node_id: n for n in root.walk()}
+
+    console.print("\n[dim]Opening cited notes via notesmd-cli...[/]")
+    for cited in cited_node_ids:
+        node = by_id.get(cited)
+        if node is None:
+            continue
+        if node.kind == "section":
+            if "#" in cited:
+                note_id = cited.split("#", 1)[0]
+                note = by_id.get(note_id)
+            else:
+                note = None
+            note_title = note.title if note else Path(cited).stem
+            argv = build_open_command(
+                note_title,
+                section_anchor=node.title,
+                vault_name=vault_name,
+            )
+        else:
+            argv = build_open_command(node.title, vault_name=vault_name)
+
+        console.print(f"  [dim]{shlex.join(argv)}[/]")
+        try:
+            subprocess.run(argv, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            console.print(f"  [red]Failed: {e}[/]")
+
+
 def _resolve_vault(vault: Path | None) -> Path:
     """Return an explicit ``--vault`` argument or auto-discover one.
 
@@ -407,18 +458,41 @@ def compile(
     type=int,
     help="Poll interval in seconds. Default: 10.",
 )
-def watch(vault: Path | None, folder: str | None, interval: int) -> None:
+@click.option(
+    "--auto-rebuild",
+    is_flag=True,
+    help="Automatically rescan and rebuild Layer 2 sub-trees when changes are detected.",
+)
+@click.option(
+    "--model",
+    default="ollama/gemma4:26b",
+    help="Model id used for --auto-rebuild cache key.",
+)
+def watch(
+    vault: Path | None,
+    folder: str | None,
+    interval: int,
+    auto_rebuild: bool,
+    model: str,
+) -> None:
     """Watch the vault for file changes and report them in real time.
 
     Polls the vault directory at the given interval and prints a summary
-    whenever notes are added, modified, or deleted. Useful for keeping
-    the PageIndex cache warm while editing in Obsidian.
+    whenever notes are added, modified, or deleted.
+
+    With ``--auto-rebuild``, each detected change triggers an automatic
+    rescan + Layer 2 sub-tree rebuild for LONG notes, keeping the
+    PageIndex cache warm while editing in Obsidian.
     """
+    from datetime import datetime as _dt
+
     from .watcher import detect_changes, save_state
 
     vault = _resolve_vault(vault)
     scope = f"{vault}{('/' + folder) if folder else ''}"
     console.print(f"[bold cyan]Watching[/] {scope} (poll every {interval}s)")
+    if auto_rebuild:
+        console.print("[dim]Auto-rebuild enabled: changes trigger rescan + cache rebuild.[/]")
     console.print("[dim]Press Ctrl+C to stop.[/]\n")
 
     # Initial snapshot
@@ -427,13 +501,11 @@ def watch(vault: Path | None, folder: str | None, interval: int) -> None:
 
     try:
         while True:
-            import time as _time
-
-            _time.sleep(interval)
+            time.sleep(interval)
             changes = detect_changes(vault, folder)
             if changes.has_changes:
                 save_state(vault, folder)
-                ts = __import__("datetime").datetime.now().strftime("%H:%M:%S")
+                ts = _dt.now().strftime("%H:%M:%S")
                 console.print(f"\n[bold yellow][{ts}] Changes detected:[/]")
                 for path in changes.added:
                     console.print(f"  [green]+[/] {path}")
@@ -444,6 +516,28 @@ def watch(vault: Path | None, folder: str | None, interval: int) -> None:
                 console.print(
                     f"[dim]  Total: {changes.total} change(s)[/]"
                 )
+
+                if auto_rebuild:
+                    console.print("[dim]  Rescanning...[/]")
+                    root = scan_folder(vault, folder)
+                    long_count = sum(
+                        1
+                        for n in root.walk()
+                        if n.kind == "note" and n.tier == NoteTier.LONG
+                    )
+                    if long_count > 0:
+                        built, from_cache = build_long_subtrees(
+                            root,
+                            vault_root=vault,
+                            model_id=model,
+                            chat_fn=None,
+                        )
+                        console.print(
+                            f"[dim]  Rebuilt {built} sub-tree(s), "
+                            f"{from_cache} from cache.[/]"
+                        )
+                    else:
+                        console.print("[dim]  No LONG notes to rebuild.[/]")
     except KeyboardInterrupt:
         console.print("\n[dim]Watch stopped.[/]")
 
@@ -471,6 +565,12 @@ def watch(vault: Path | None, folder: str | None, interval: int) -> None:
     is_flag=True,
     help="Skip the atomic-note summarization pass (faster, worse ToC).",
 )
+@click.option(
+    "--open",
+    "open_cited",
+    is_flag=True,
+    help="Open cited notes in the editor via notesmd-cli (instead of just printing hints).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -478,6 +578,7 @@ def ask(
     model: str,
     num_ctx: int,
     skip_summaries: bool,
+    open_cited: bool,
 ) -> None:
     """Run a multi-hop reasoning query against a vault folder."""
     vault = _resolve_vault(vault)
@@ -542,7 +643,10 @@ def ask(
         for cited in result.cited_nodes:
             console.print(f"  • {cited}")
 
-        _print_notesmd_open_hints(result.cited_nodes, root, vault=vault)
+        if open_cited:
+            _open_cited_notes(result.cited_nodes, root, vault=vault)
+        else:
+            _print_notesmd_open_hints(result.cited_nodes, root, vault=vault)
 
     console.print(
         f"\n[dim]iterations={result.iterations_used}  elapsed={elapsed:.1f}s[/]"

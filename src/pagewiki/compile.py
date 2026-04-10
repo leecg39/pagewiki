@@ -31,6 +31,8 @@ Design notes
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
 from collections import defaultdict
 from collections.abc import Callable
@@ -45,6 +47,7 @@ ChatFn = Callable[[str], str]
 WIKI_DIRNAME = "LLM-Wiki"
 INDEX_FILENAME = "index.md"
 LOG_FILENAME = "log.md"
+ENTITIES_CACHE_FILENAME = "entities-cache.json"
 
 # Safety cap — skip notes above this size to avoid blowing context
 _MAX_NOTE_CHARS = 12_000
@@ -283,6 +286,133 @@ def generate_log_entry(
     )
 
 
+def _save_entities_cache(
+    wiki_dir: Path,
+    entities: dict[str, Entity],
+    note_mtimes: dict[str, int],
+) -> None:
+    """Persist extracted entities + source mtimes for incremental reuse."""
+    payload = {
+        "mtimes": note_mtimes,
+        "entities": {
+            key: {
+                "name": e.name,
+                "category": e.category,
+                "mentions": [
+                    {
+                        "source_title": m.source_title,
+                        "source_node_id": m.source_node_id,
+                        "description": m.description,
+                    }
+                    for m in e.mentions
+                ],
+            }
+            for key, e in entities.items()
+        },
+    }
+    cache_file = wiki_dir / ENTITIES_CACHE_FILENAME
+    cache_file.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _load_entities_cache(
+    wiki_dir: Path,
+) -> tuple[dict[str, int], dict[str, Entity]] | None:
+    """Load cached entities + mtimes. Returns ``None`` on miss."""
+    cache_file = wiki_dir / ENTITIES_CACHE_FILENAME
+    if not cache_file.exists():
+        return None
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    mtimes = payload.get("mtimes", {})
+    raw_entities = payload.get("entities", {})
+    entities: dict[str, Entity] = {}
+    for key, data in raw_entities.items():
+        entities[key] = Entity(
+            name=data["name"],
+            category=data.get("category", ""),
+            mentions=[
+                EntityMention(
+                    source_title=m["source_title"],
+                    source_node_id=m["source_node_id"],
+                    description=m["description"],
+                )
+                for m in data.get("mentions", [])
+            ],
+        )
+    return mtimes, entities
+
+
+def _incremental_extract(
+    root: TreeNode,
+    chat_fn: ChatFn,
+    cached_mtimes: dict[str, int],
+    cached_entities: dict[str, Entity],
+) -> tuple[dict[str, Entity], dict[str, int]]:
+    """Re-extract only from notes whose mtime changed since the last run.
+
+    Unchanged notes reuse their cached entity mentions.  Deleted notes
+    have their mentions purged.  New/modified notes are re-extracted.
+    """
+    # Build current mtime map
+    current_mtimes: dict[str, int] = {}
+    notes_to_extract: list[TreeNode] = []
+    for node in root.walk():
+        if node.kind != "note" or node.file_path is None:
+            continue
+        if not node.file_path.exists():
+            continue
+        node_id = node.node_id
+        try:
+            mtime = node.file_path.stat().st_mtime_ns
+        except OSError:
+            continue
+        current_mtimes[node_id] = mtime
+        if node_id not in cached_mtimes or cached_mtimes[node_id] != mtime:
+            notes_to_extract.append(node)
+
+    # Start with cached entities, removing mentions from changed/deleted notes
+    changed_ids = {n.node_id for n in notes_to_extract}
+    deleted_ids = set(cached_mtimes.keys()) - set(current_mtimes.keys())
+    stale_ids = changed_ids | deleted_ids
+
+    entities: dict[str, Entity] = {}
+    for key, entity in cached_entities.items():
+        kept = [m for m in entity.mentions if m.source_node_id not in stale_ids]
+        if kept:
+            entities[key] = Entity(
+                name=entity.name, category=entity.category, mentions=kept
+            )
+
+    # Extract from changed/new notes
+    for node in notes_to_extract:
+        content = node.file_path.read_text(encoding="utf-8")  # type: ignore[union-attr]
+        if not content.strip():
+            continue
+        prompt = _extract_entities_prompt(node.title, content)
+        response = chat_fn(prompt)
+        for name, category, description in parse_entities(response):
+            norm_key = name.strip().lower()
+            if norm_key not in entities:
+                entities[norm_key] = Entity(name=name, category=category)
+            entities[norm_key].mentions.append(
+                EntityMention(
+                    source_title=node.title,
+                    source_node_id=node.node_id,
+                    description=description,
+                )
+            )
+
+    # Remove entities with no mentions left
+    entities = {k: v for k, v in entities.items() if v.mentions}
+
+    return entities, current_mtimes
+
+
 def compile_wiki(
     root: TreeNode,
     vault_root: Path,
@@ -307,8 +437,20 @@ def compile_wiki(
     # Count source notes
     source_count = sum(1 for n in root.walk() if n.kind == "note")
 
-    # Pass 1: extract entities
-    entities = extract_entities_from_tree(root, chat_fn)
+    # Pass 1: extract entities (incremental when cache exists)
+    cached = _load_entities_cache(wiki_dir)
+    if cached is not None:
+        cached_mtimes, cached_entities = cached
+        entities, note_mtimes = _incremental_extract(
+            root, chat_fn, cached_mtimes, cached_entities
+        )
+    else:
+        entities = extract_entities_from_tree(root, chat_fn)
+        note_mtimes = {}
+        for node in root.walk():
+            if node.kind == "note" and node.file_path and node.file_path.exists():
+                with contextlib.suppress(OSError):
+                    note_mtimes[node.node_id] = node.file_path.stat().st_mtime_ns
 
     if not entities:
         # Write a minimal index noting no entities found
@@ -330,6 +472,9 @@ def compile_wiki(
     # Write index.md
     index_content = generate_index(entities)
     (wiki_dir / INDEX_FILENAME).write_text(index_content, encoding="utf-8")
+
+    # Persist entity cache for incremental reuse
+    _save_entities_cache(wiki_dir, entities, note_mtimes)
 
     # Append to log.md
     log_path = wiki_dir / LOG_FILENAME

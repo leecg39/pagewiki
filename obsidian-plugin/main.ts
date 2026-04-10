@@ -255,9 +255,15 @@ class PageWikiSettingTab extends PluginSettingTab {
 
 export default class PageWikiPlugin extends Plugin {
 	settings: PageWikiSettings = DEFAULT_SETTINGS;
+	private statusBarEl: HTMLElement | null = null;
+	private watchInterval: ReturnType<typeof setInterval> | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+
+		// Status bar item for watch mode
+		this.statusBarEl = this.addStatusBarItem();
+		this.statusBarEl.setText("PageWiki: idle");
 
 		// Command: Scan
 		this.addCommand({
@@ -294,6 +300,13 @@ export default class PageWikiPlugin extends Plugin {
 			callback: () => this.runVaults(),
 		});
 
+		// Command: Toggle watch mode
+		this.addCommand({
+			id: "pagewiki-watch-toggle",
+			name: "Toggle watch mode",
+			callback: () => this.toggleWatch(),
+		});
+
 		// Settings tab
 		this.addSettingTab(new PageWikiSettingTab(this.app, this));
 
@@ -301,6 +314,10 @@ export default class PageWikiPlugin extends Plugin {
 		this.addRibbonIcon("search", "PageWiki Ask", () => {
 			this.openAskModal();
 		});
+	}
+
+	onunload(): void {
+		this.stopWatch();
 	}
 
 	async loadSettings(): Promise<void> {
@@ -362,8 +379,6 @@ export default class PageWikiPlugin extends Plugin {
 
 	private async runVaults(): Promise<void> {
 		try {
-			// vaults command doesn't need --vault
-			const vaultPath = (this.app.vault.adapter as any).basePath as string;
 			const cmd = `${this.settings.pythonPath} -m pagewiki vaults`;
 			const output = await new Promise<string>((resolve, reject) => {
 				exec(
@@ -378,6 +393,78 @@ export default class PageWikiPlugin extends Plugin {
 			new ResultModal(this.app, "Discovered Vaults", output).open();
 		} catch (e: any) {
 			new Notice(`PageWiki vaults failed: ${e.message}`, 10000);
+		}
+	}
+
+	private toggleWatch(): void {
+		if (this.watchInterval) {
+			this.stopWatch();
+			new Notice("PageWiki: Watch stopped");
+		} else {
+			this.startWatch();
+			new Notice("PageWiki: Watch started");
+		}
+	}
+
+	private startWatch(): void {
+		if (this.watchInterval) return;
+
+		// Save initial state
+		runPagewiki(this.app, this.settings, `scan --folder "${this.settings.folder}"`)
+			.catch(() => {});
+
+		if (this.statusBarEl) {
+			this.statusBarEl.setText("PageWiki: watching");
+			this.statusBarEl.style.color = "var(--text-success)";
+		}
+
+		this.watchInterval = setInterval(async () => {
+			try {
+				const vaultPath = (this.app.vault.adapter as any).basePath as string;
+				const cmd =
+					`${this.settings.pythonPath} -c "` +
+					`from pagewiki.watcher import detect_changes, save_state; ` +
+					`cs = detect_changes(r'${vaultPath}', '${this.settings.folder}'); ` +
+					`print(f'{len(cs.added)}|{len(cs.modified)}|{len(cs.deleted)}'); ` +
+					`save_state(r'${vaultPath}', '${this.settings.folder}') if cs.has_changes else None"`;
+
+				const output = await new Promise<string>((resolve, reject) => {
+					exec(
+						cmd,
+						{ timeout: 15_000, env: { ...process.env, NO_COLOR: "1" } },
+						(error, stdout, stderr) => {
+							if (error) reject(new Error(stderr || error.message));
+							else resolve(stdout.trim());
+						},
+					);
+				});
+
+				const [added, modified, deleted] = output.split("|").map(Number);
+				const total = added + modified + deleted;
+
+				if (total > 0 && this.statusBarEl) {
+					this.statusBarEl.setText(
+						`PageWiki: +${added} ~${modified} -${deleted}`,
+					);
+					new Notice(
+						`PageWiki: ${total} file(s) changed (${added} new, ${modified} modified, ${deleted} deleted)`,
+						5000,
+					);
+				}
+			} catch {
+				// Silently ignore poll errors
+			}
+		}, 10_000);
+	}
+
+	private stopWatch(): void {
+		if (this.watchInterval) {
+			clearInterval(this.watchInterval);
+			this.watchInterval = null;
+		}
+		if (this.statusBarEl) {
+			this.statusBarEl.setText("PageWiki: idle");
+			this.statusBarEl.style.color = "";
 		}
 	}
 }
