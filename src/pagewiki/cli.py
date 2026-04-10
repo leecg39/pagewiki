@@ -55,6 +55,129 @@ def _format_dangling_line(source_id: str, raw_target: str) -> str:
     return f"  [yellow]{safe_source}[/] → \\[\\[{safe_target}]]"
 
 
+def _resolve_vault_name_for_hints(vault: Path) -> str | None:
+    """Map a resolved vault ``Path`` to its notesmd-cli vault *name*.
+
+    Walks ``list_known_vaults()`` and returns the name of the first
+    entry whose path resolves to the same absolute path as ``vault``.
+    Falls back to the vault directory's basename when nothing matches
+    (e.g. notesmd-cli is not installed AND the vault is not in
+    obsidian.json yet). Returns ``None`` only if ``vault.name`` is
+    itself empty, which should not happen in practice.
+
+    Used by ``_print_notesmd_open_hints`` to address the
+    chatgpt-codex-connector P2 review on PR #3: hints without
+    ``--vault`` can open a same-titled note in the wrong vault when
+    the user has multiple vaults registered.
+    """
+    from .obsidian_config import list_known_vaults
+
+    try:
+        vault_resolved = vault.expanduser().resolve()
+    except OSError:
+        vault_resolved = vault
+
+    for known in list_known_vaults():
+        try:
+            if known.path.expanduser().resolve() == vault_resolved:
+                return known.name
+        except OSError:
+            continue
+    return vault.name or None
+
+
+def _print_notesmd_open_hints(
+    cited_node_ids: list[str], root, *, vault: Path
+) -> None:
+    """Print copy-paste-ready ``notesmd-cli open`` commands for each citation.
+
+    Only emitted when ``notesmd-cli`` is actually on PATH — no point
+    showing the hint block otherwise. Resolves each pagewiki
+    ``<rel_path>#<zfill_id>`` citation back to its human-readable
+    ``(note_title, section_title)`` pair by walking the tree, then
+    formats an argv via ``obsidian_config.build_open_command`` and
+    shell-quotes it for the terminal.
+
+    Passes ``vault_name=`` to ``build_open_command`` so the generated
+    commands include ``--vault <name>`` (P2 fix on PR #3 Codex
+    review) — without it, a same-titled note in a different vault
+    could be opened instead of the one pagewiki actually read.
+    """
+    import shlex
+
+    from .obsidian_config import _notesmd_cli_on_path, build_open_command
+
+    if not _notesmd_cli_on_path():
+        return
+
+    vault_name = _resolve_vault_name_for_hints(vault)
+
+    # Build a node_id → TreeNode lookup so we can translate the
+    # citation strings back into titles.
+    by_id = {n.node_id: n for n in root.walk()}
+
+    console.print("\n[dim]Open in editor via notesmd-cli:[/]")
+    for cited in cited_node_ids:
+        node = by_id.get(cited)
+        if node is None:
+            continue
+        # For section citations, the note title is the parent note's
+        # title and the anchor is the section title. For note-level
+        # citations, there's no anchor.
+        if node.kind == "section":
+            # Find the enclosing note by walking back up the rel_path:
+            # "Research/paper.md#0003" → note_id "Research/paper.md".
+            if "#" in cited:
+                note_id = cited.split("#", 1)[0]
+                note = by_id.get(note_id)
+            else:
+                note = None
+            note_title = note.title if note else Path(cited).stem
+            argv = build_open_command(
+                note_title,
+                section_anchor=node.title,
+                vault_name=vault_name,
+            )
+        else:
+            argv = build_open_command(node.title, vault_name=vault_name)
+        console.print(f"  {shlex.join(argv)}")
+
+
+def _resolve_vault(vault: Path | None) -> Path:
+    """Return an explicit ``--vault`` argument or auto-discover one.
+
+    Auto-discovery tries ``notesmd-cli print-default --path-only``
+    first, then falls back to reading ``obsidian.json`` directly.
+    On total miss, prints a helpful error listing both the Obsidian
+    config path and the notesmd-cli install instructions, then
+    exits with code 1.
+    """
+    if vault is not None:
+        return vault
+
+    from .obsidian_config import discover_default_vault
+
+    discovered = discover_default_vault()
+    if discovered is None:
+        console.print(
+            "[red]No vault specified and auto-discovery failed.[/]\n\n"
+            "Fix by either:\n"
+            "  1. [bold]Pass --vault explicitly[/]:\n"
+            '       pagewiki scan --vault "~/Documents/Obsidian Vault" ...\n\n'
+            "  2. [bold]Install notesmd-cli[/] (Yakitrak/notesmd-cli) and set a default vault:\n"
+            "       brew install yakitrak/notesmd-cli/notesmd-cli   # macOS\n"
+            "       notesmd-cli set-default <vault-name>\n\n"
+            "  3. [bold]Open your vault in Obsidian at least once[/] so it writes\n"
+            "     its path to the Obsidian config file:\n"
+            "       macOS:   ~/Library/Application Support/obsidian/obsidian.json\n"
+            "       Linux:   ~/.config/obsidian/obsidian.json"
+        )
+        sys.exit(1)
+
+    console.print(f"[dim]Auto-discovered vault: {discovered}[/]")
+    return discovered
+
+
 @click.group()
 @click.version_option(__version__, prog_name="pagewiki")
 def main() -> None:
@@ -64,8 +187,10 @@ def main() -> None:
 @main.command()
 @click.option(
     "--vault",
-    required=True,
+    default=None,
     type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root. If omitted, auto-discovered via "
+    "notesmd-cli or obsidian.json.",
 )
 @click.option(
     "--folder", default=None, help="Subfolder inside the vault (e.g. Research)."
@@ -86,13 +211,14 @@ def main() -> None:
     help="Model id used as part of the cache key for --build-long.",
 )
 def scan(
-    vault: Path,
+    vault: Path | None,
     folder: str | None,
     build_long: bool,
     show_graph: bool,
     model: str,
 ) -> None:
     """Scan a vault folder and report 3-tier classification counts."""
+    vault = _resolve_vault(vault)
     console.print(f"[bold cyan]Scanning[/] {vault}{('/' + folder) if folder else ''}")
     root = scan_folder(vault, folder)
 
@@ -176,11 +302,47 @@ def scan(
 
 
 @main.command()
+def vaults() -> None:
+    """List every Obsidian vault discoverable via notesmd-cli or obsidian.json.
+
+    Uses the same discovery pipeline as ``scan`` and ``ask`` — but
+    just prints the results instead of picking one.
+    """
+    from .obsidian_config import list_known_vaults
+
+    known = list_known_vaults()
+    if not known:
+        console.print(
+            "[yellow]No vaults discovered.[/]\n\n"
+            "Either install [bold]notesmd-cli[/] (Yakitrak/notesmd-cli),\n"
+            "or open a vault in Obsidian at least once so its path is\n"
+            "written to the Obsidian config."
+        )
+        sys.exit(1)
+
+    table = Table(title="Obsidian Vaults")
+    table.add_column("Name", style="bold")
+    table.add_column("Path")
+    table.add_column("Default", justify="center")
+    table.add_column("Exists", justify="center")
+    for v in known:
+        table.add_row(
+            v.name,
+            str(v.path),
+            "✓" if v.is_default else "",
+            "✓" if v.path.exists() else "[red]missing[/]",
+        )
+    console.print(table)
+
+
+@main.command()
 @click.argument("query")
 @click.option(
     "--vault",
-    required=True,
+    default=None,
     type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root. If omitted, auto-discovered via "
+    "notesmd-cli or obsidian.json.",
 )
 @click.option(
     "--folder", default="Research", help="Subfolder inside the vault. Default: Research"
@@ -198,13 +360,14 @@ def scan(
 )
 def ask(
     query: str,
-    vault: Path,
+    vault: Path | None,
     folder: str,
     model: str,
     num_ctx: int,
     skip_summaries: bool,
 ) -> None:
     """Run a multi-hop reasoning query against a vault folder."""
+    vault = _resolve_vault(vault)
     console.print(f"[bold cyan]Q:[/] {query}")
     console.print(f"  vault={vault}  folder={folder}  model={model}\n")
 
@@ -260,6 +423,8 @@ def ask(
         console.print("[bold]Cited nodes:[/]")
         for cited in result.cited_nodes:
             console.print(f"  • {cited}")
+
+        _print_notesmd_open_hints(result.cited_nodes, root, vault=vault)
 
     console.print(
         f"\n[dim]iterations={result.iterations_used}  elapsed={elapsed:.1f}s[/]"
