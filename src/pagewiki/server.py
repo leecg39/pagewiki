@@ -194,7 +194,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.17.0")
+    app = FastAPI(title="pagewiki API", version="0.18.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -335,7 +335,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.17.0",
+            "version": "0.18.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,

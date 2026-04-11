@@ -1583,9 +1583,12 @@ def serve(
         import uvicorn
     except ImportError:
         console.print(
-            "[red]uvicorn is not installed.[/]\n"
-            "Install the server extra:\n"
-            "    pip install 'pagewiki[server]'"
+            "[red]uvicorn is not installed.[/]\n\n"
+            "[bold]Fix:[/] install the optional [cyan]server[/] extra which\n"
+            "pulls in FastAPI + uvicorn in one shot:\n\n"
+            "    [bold]pip install 'pagewiki[server]'[/]\n\n"
+            "After installing, re-run [cyan]pagewiki serve[/]. If you're\n"
+            "using a virtualenv make sure you install inside it."
         )
         sys.exit(1)
 
@@ -1768,7 +1771,13 @@ def usage_report(
         try:
             dt = datetime.fromisoformat(s)
         except ValueError:
-            console.print(f"[red]Invalid ISO timestamp: {s}[/]")
+            console.print(
+                f"[red]Invalid ISO timestamp:[/] {s!r}\n\n"
+                "[bold]Examples of valid input:[/]\n"
+                "  2024-11-01                # date only\n"
+                "  2024-11-01T12:00:00       # date + time\n"
+                "  2024-11-01T12:00:00+09:00 # with timezone"
+            )
             sys.exit(1)
         return dt.timestamp()
 
