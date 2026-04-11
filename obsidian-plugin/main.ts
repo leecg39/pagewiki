@@ -57,6 +57,10 @@ interface PageWikiSettings {
 	// (summarize:retrieve:synthesis). Only meaningful when
 	// ``maxTokens > 0`` and server mode is active.
 	tokenSplit: string;
+	// v0.16 — opt in to the server's prompt-cache mode over
+	// WebSocket. Requires `pagewiki serve --prompt-cache` on the
+	// server side; ignored when the server wasn't started with it.
+	promptCacheWebSocket: boolean;
 }
 
 const DEFAULT_SETTINGS: PageWikiSettings = {
@@ -73,6 +77,7 @@ const DEFAULT_SETTINGS: PageWikiSettings = {
 	serverUrl: "",
 	useWebSocket: false,
 	tokenSplit: "",
+	promptCacheWebSocket: false,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -134,6 +139,9 @@ interface AskOptions {
 	tokenSplit?: string;
 	jsonMode?: boolean;
 	reuseContext?: boolean;
+	// v0.16 — opt into server-side prompt cache. Server must have
+	// been started with `--prompt-cache` for this to take effect.
+	promptCache?: boolean;
 }
 
 function connectAskWS(
@@ -165,6 +173,7 @@ function connectAskWS(
 		}
 		if (opts.jsonMode) askFrame.json_mode = true;
 		if (opts.reuseContext) askFrame.reuse_context = true;
+		if (opts.promptCache) askFrame.prompt_cache = true;
 		ws.send(JSON.stringify(askFrame));
 	});
 
@@ -679,6 +688,7 @@ class ChatModal extends Modal {
 					tokenSplit: this.settings.tokenSplit,
 					jsonMode: this.settings.jsonMode,
 					reuseContext: this.settings.reuseContext,
+					promptCache: this.settings.promptCacheWebSocket,
 				},
 				{
 					onTrace: (data) => {
@@ -1020,6 +1030,22 @@ class PageWikiSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.tokenSplit)
 					.onChange(async (value) => {
 						this.plugin.settings.tokenSplit = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Prompt cache (WebSocket mode)")
+			.setDesc(
+				"Ask the server to use its prompt-cache chat_fn for this " +
+				"connection. Requires `pagewiki serve --prompt-cache` on " +
+				"the server side; ignored otherwise (v0.16).",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.promptCacheWebSocket)
+					.onChange(async (value) => {
+						this.plugin.settings.promptCacheWebSocket = value;
 						await this.plugin.saveSettings();
 					}),
 			);

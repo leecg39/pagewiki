@@ -113,6 +113,11 @@ class ServerState:
     # /usage endpoint reports historical totals in addition to the
     # in-memory tracker. Enabled via `pagewiki serve --usage-db PATH`.
     usage_store: UsageStore | None = None
+    # v0.16 optional prompt-cache chat_fn. When set, per-request
+    # endpoints (/ask/ws, future /ask/stream) can opt into the
+    # prompt-cache path on a per-query basis via the request frame.
+    # Signature: (system, user) -> str. Wired up by cli.serve.
+    system_chat_fn: object | None = None
 
     def rescan(self) -> dict[str, int]:
         """Re-scan the vault(s) and rebuild caches in place.
@@ -189,7 +194,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.15.0")
+    app = FastAPI(title="pagewiki API", version="0.16.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -323,7 +328,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.15.0",
+            "version": "0.16.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -970,9 +975,19 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             max_tokens: int | None,
             json_mode: bool,
             reuse_context: bool,
+            prompt_cache: bool,
         ) -> None:
+            # v0.16: per-request prompt cache opt-in. When the client
+            # asks for it AND the server was started with --prompt-cache
+            # (state.system_chat_fn attached), thread it into retrieval.
+            active_system_chat_fn = (
+                state.system_chat_fn if (prompt_cache and state.system_chat_fn) else None
+            )
             try:
                 if decompose:
+                    # Decompose doesn't accept system_chat_fn yet; use
+                    # regular path (json_mode and decompose override
+                    # prompt cache benefit anyway).
                     result = run_decomposed_retrieval(
                         query, state.root, tracked_chat_fn,
                         link_index=state.link_index,
@@ -992,6 +1007,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                         tracker=local_tracker,
                         json_mode=json_mode,
                         reuse_context=reuse_context,
+                        system_chat_fn=active_system_chat_fn,
                     )
                 if stop_event.is_set():
                     event_queue.put(("cancelled", {}))
@@ -1103,6 +1119,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                             "max_tokens": parsed_max_tokens,
                             "json_mode": bool(msg.get("json_mode", False)),
                             "reuse_context": bool(msg.get("reuse_context", False)),
+                            "prompt_cache": bool(msg.get("prompt_cache", False)),
                         },
                         daemon=True,
                     )

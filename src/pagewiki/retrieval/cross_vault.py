@@ -48,6 +48,7 @@ def run_cross_vault_retrieval(
     decompose: bool = False,
     system_chat_fn: SystemChatFn | None = None,
     parallel_workers: int = 1,
+    allow_partial: bool = False,
 ) -> RetrievalResult:
     """Run a retrieval loop independently per vault, then synthesize (v0.12).
 
@@ -85,7 +86,7 @@ def run_cross_vault_retrieval(
 
     def _run_one(
         i: int, vault_root: TreeNode, label: str, link_idx: LinkIndex | None,
-    ) -> tuple[int, str, RetrievalResult]:
+    ) -> tuple[int, str, RetrievalResult | None, Exception | None]:
         if on_event is not None:
             on_event(
                 TraceStep(
@@ -94,37 +95,53 @@ def run_cross_vault_retrieval(
                     f"[{i + 1}/{n}] {label} 탐색 시작",
                 )
             )
-        if decompose:
-            sub_result = run_decomposed_retrieval(
-                query,
-                vault_root,
-                chat_fn,
-                max_iterations=max_iterations,
-                max_gathered=max_gathered,
-                link_index=link_idx,
-                on_event=on_event,
-                max_tokens=max_tokens,
-                tracker=tracker,
-                json_mode=json_mode,
-                reuse_context=reuse_context,
-            )
-        else:
-            sub_result = run_retrieval(
-                query,
-                vault_root,
-                chat_fn,
-                max_iterations=max_iterations,
-                max_gathered=max_gathered,
-                link_index=link_idx,
-                on_event=on_event,
-                max_tokens=max_tokens,
-                tracker=tracker,
-                json_mode=json_mode,
-                reuse_context=reuse_context,
-                should_stop=should_stop,
-                system_chat_fn=system_chat_fn,
-            )
-        return i, label, sub_result
+        try:
+            if decompose:
+                sub_result = run_decomposed_retrieval(
+                    query,
+                    vault_root,
+                    chat_fn,
+                    max_iterations=max_iterations,
+                    max_gathered=max_gathered,
+                    link_index=link_idx,
+                    on_event=on_event,
+                    max_tokens=max_tokens,
+                    tracker=tracker,
+                    json_mode=json_mode,
+                    reuse_context=reuse_context,
+                )
+            else:
+                sub_result = run_retrieval(
+                    query,
+                    vault_root,
+                    chat_fn,
+                    max_iterations=max_iterations,
+                    max_gathered=max_gathered,
+                    link_index=link_idx,
+                    on_event=on_event,
+                    max_tokens=max_tokens,
+                    tracker=tracker,
+                    json_mode=json_mode,
+                    reuse_context=reuse_context,
+                    should_stop=should_stop,
+                    system_chat_fn=system_chat_fn,
+                )
+            return i, label, sub_result, None
+        except Exception as exc:
+            # v0.16: swallow when ``allow_partial=True`` so the caller
+            # can synthesize from the remaining successful vaults.
+            # Otherwise re-raise so strict callers still fail loudly.
+            if allow_partial:
+                if on_event is not None:
+                    on_event(
+                        TraceStep(
+                            "cross-vault",
+                            None,
+                            f"[{i + 1}/{n}] {label} 실패 — allow_partial=True, 건너뜀: {exc}",
+                        )
+                    )
+                return i, label, None, exc
+            raise
 
     indexed_inputs = list(
         enumerate(zip(vault_roots, labels, indexes, strict=True))
@@ -151,9 +168,21 @@ def run_cross_vault_retrieval(
     raw.sort(key=lambda t: t[0])
 
     per_vault_results: list[tuple[str, RetrievalResult]] = []
+    failed_labels: list[str] = []
     merged_cited: list[str] = []
     merged_trace: list[TraceStep] = []
-    for _i, label, sub_result in raw:
+    for _i, label, sub_result, exc in raw:
+        if sub_result is None:
+            # v0.16: failed vault (only possible with allow_partial=True).
+            failed_labels.append(label)
+            merged_trace.append(
+                TraceStep(
+                    "cross-vault",
+                    None,
+                    f"{label} 실패 (partial): {exc}",
+                )
+            )
+            continue
         per_vault_results.append((label, sub_result))
         merged_trace.extend(sub_result.trace)
         for nid in sub_result.cited_nodes:
@@ -161,10 +190,31 @@ def run_cross_vault_retrieval(
             if prefixed not in merged_cited:
                 merged_cited.append(prefixed)
 
+    if not per_vault_results:
+        # Every vault failed. Return a clear error without a synth call.
+        fail_msg = (
+            f"[전체 실패] 모든 vault의 retrieval이 실패했습니다: "
+            f"{', '.join(failed_labels) or '(이름 없음)'}"
+        )
+        return RetrievalResult(
+            answer=fail_msg,
+            cited_nodes=[],
+            trace=merged_trace,
+            iterations_used=0,
+        )
+
     pairs = [
         (f"{label}에서 찾은 내용", result.answer)
         for label, result in per_vault_results
     ]
+    if failed_labels:
+        pairs.append(
+            (
+                "참고",
+                f"다음 vault는 실패해서 결과에서 제외되었습니다: "
+                f"{', '.join(failed_labels)}",
+            )
+        )
     synth_prompt = synthesize_multi_answer_prompt(query, pairs)
     final_answer = chat_fn(synth_prompt).strip()
 

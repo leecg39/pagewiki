@@ -223,7 +223,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.12 | WebSocket + daily 롤업 + cross-vault + 플러그인 server-mode — 아래 §7.7 상세 |
 | v0.13 | 폴리싱 + 리팩토링 — chat flags, real tokens, plugin Cancel, cross-vault×decompose, CSV/JSON, retrieval split — 아래 §7.8 상세 |
 | v0.14 | DB 정리 + `/usage/history` + Web UI + 예산 분배 + 프롬프트 캐싱 — 아래 §7.9 상세 |
-| **v0.15** (현재) | **Cross-vault parallel + cache hit rate + history stream + WS ext + sparkline** — 아래 §7.10 상세 |
+| v0.15 | Cross-vault parallel + cache hit rate + history stream + WS ext + sparkline — 아래 §7.10 상세 |
+| **v0.16** (현재) | **Parallel budget waves + inferred cache savings + history UI + WS prompt-cache + allow_partial** — 아래 §7.11 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -334,13 +335,23 @@ DELETE /chat/{sid}      # 세션 삭제
 | Plugin WebSocket 확장 | obsidian-plugin/main.ts `connectAskWS(opts)`, server.py `/ask/ws` | `ask` 프레임에 `max_tokens`/`token_split`/`json_mode`/`reuse_context` 수용. 서버는 token_split 비율을 파싱해 retrieve+synth 합산을 `run_retrieval(max_tokens=...)`에 적용. 플러그인 Settings에 `tokenSplit` 텍스트 필드 추가. |
 | Web UI sparkline | webui.py `_HTML_TEMPLATE` | SVG `<polyline>` 기반 인라인 스파크라인. `usage` SSE 이벤트마다 `usageSeries` 에 누적 → `renderSparkline()` 호출. 외부 차트 라이브러리 없음, 40×200px. |
 
-### 7.11 v0.16+ 향후 계획
+### 7.11 v0.16 상세
 
-- Parallel summarize 도중 token budget 체크 주기 개선 (현재는 한 노트 단위)
-- Prompt cache 실제 hit 레이턴시 측정 (Ollama API 확장 시)
-- Web UI에서 `/usage/history/stream` 구독 (historical 뷰)
-- 플러그인 WebSocket에서 prompt-cache 토글 노출
-- `run_cross_vault_retrieval` 에 부분 실패 허용 옵션 (한 vault가 실패해도 나머지 결과로 합성)
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| Parallel summarize 예산 파동 | vault.py `summarize_atomic_notes` | `max_tokens + tracker` 설정 시 병렬 경로도 작동: `ThreadPoolExecutor.map`을 `max_workers` 크기의 wave로 나눠 호출하고, 각 wave 사이에 budget 체크. 기존의 "budget이면 무조건 순차" 제약 제거, 예산 엄수하면서도 병렬 속도 유지. |
+| Inferred cache 레이턴시 savings | usage.py `cacheable_latency_savings()` | Ollama가 실제 KV-hit/miss를 노출하지 않으므로 간접 측정: 첫 cacheable 호출을 cold proxy, 이후 호출의 평균을 hit proxy로 가정. `{first_call_seconds, subsequent_mean_seconds, savings_per_call_seconds, inferred_hit_rate, samples}` 반환. `ask --usage`가 savings 라인을 추가로 출력. |
+| Web UI historical 뷰 | webui.py | 접을 수 있는 `<details>` 섹션 추가. Start/Stop 버튼으로 `/usage/history/stream` 구독 on/off. `initial`/`event`/`heartbeat`/`done` 프레임 파싱해서 4-column 테이블에 append. 최대 200행으로 capped. 외부 deps 없음. |
+| Plugin WS prompt-cache 토글 | server.py `ServerState.system_chat_fn`, cli.py `serve --prompt-cache`, plugin `promptCacheWebSocket` | 서버가 선택적 `system_chat_fn`을 보유. WebSocket `ask` 프레임에 `prompt_cache: true`가 있고 서버에 system_chat_fn이 있으면 해당 경로로 retrieval 실행. `_make_system_chat_fn` 재사용. 플러그인 Settings에 토글 추가. |
+| Cross-vault `allow_partial` | retrieval/cross_vault.py | 한 vault의 `_run_one`이 예외를 raise할 때 `allow_partial=False`면 전파, `True`면 잡아서 실패 vault만 제외하고 나머지로 synthesis. 모든 vault가 실패하면 `"전체 실패"` 메시지 반환 (synth 호출 생략). CLI `ask --allow-partial`. |
+
+### 7.12 v0.17+ 향후 계획
+
+- Streaming 중간에 WebSocket cancel → 서버 cleanup 로그 + retry 가이드
+- Plugin에 historical view 버튼 (현재는 Web UI 전용)
+- Usage DB retention policy를 `serve` 시작 시 주기 실행
+- Cross-vault 부분 실패 시 실패 vault 재시도 옵션
+- Prompt cache 통계를 `/usage` 엔드포인트에 포함
 
 ## 8. 명시적 비목표 (Non-Goals)
 

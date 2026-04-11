@@ -198,14 +198,33 @@ def summarize_atomic_notes(
         summary = chat_fn(prompt).strip().strip("\"'").strip()
         return node, summary
 
-    # Phase 2: parallel LLM dispatch. v0.14 budget-aware path runs
-    # sequentially so we can stop as soon as ``max_tokens`` is hit.
+    # Phase 2: parallel LLM dispatch. v0.16: budget-aware parallel path.
+    # We submit work in waves of ``max_workers`` futures, checking the
+    # budget between waves so we can stop mid-flight without waiting for
+    # every queued job to drain. This keeps the fast path (no budget)
+    # identical to v0.14 while making budget enforcement concurrent.
     if max_tokens is not None and tracker is not None:
         results: list[tuple[TreeNode, str]] = []
-        for node in pending:
-            if _over_budget():
-                break
-            results.append(_summarize_one(node))
+        if max_workers <= 1:
+            for node in pending:
+                if _over_budget():
+                    break
+                results.append(_summarize_one(node))
+        else:
+            # Split pending into waves and check the budget between
+            # waves. A wave is `max_workers` notes; each wave is
+            # dispatched via ThreadPoolExecutor.map which blocks until
+            # all futures complete. Between waves we check the tracker
+            # and bail out early when the cap has been hit.
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                idx = 0
+                while idx < len(pending):
+                    if _over_budget():
+                        break
+                    wave = pending[idx : idx + max_workers]
+                    wave_results = list(pool.map(_summarize_one, wave))
+                    results.extend(wave_results)
+                    idx += len(wave)
     elif max_workers <= 1 or len(pending) == 1:
         results = [_summarize_one(n) for n in pending]
     else:

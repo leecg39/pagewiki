@@ -113,6 +113,47 @@ _HTML_TEMPLATE = r"""<!doctype html>
     font-size: 11px; color: var(--muted);
   }
   .sparkline-card .labels strong { color: var(--fg); font-size: 13px; }
+  details.history-card summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 6px;
+    user-select: none;
+  }
+  details.history-card summary:hover { color: var(--fg); }
+  .history-table {
+    width: 100%;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-top: 6px;
+  }
+  .history-table .row {
+    display: grid;
+    grid-template-columns: 160px 80px 1fr 1fr;
+    gap: 8px;
+    padding: 2px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .history-table .row:last-child { border-bottom: none; }
+  .history-table .header {
+    color: var(--fg);
+    font-weight: 600;
+    border-bottom: 1px solid var(--accent);
+  }
+  .history-controls {
+    display: flex; gap: 8px; align-items: center;
+  }
+  .history-controls button { padding: 4px 10px; font-size: 11px; }
+  .history-status {
+    font-size: 11px; color: var(--muted);
+    margin-left: auto;
+  }
 </style>
 </head>
 <body>
@@ -169,6 +210,24 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <span id="spark-points" style="font-size: 10px;">0 calls</span>
     </div>
   </div>
+
+  <details class="card history-card">
+    <summary>Historical usage events (/usage/history/stream)</summary>
+    <div class="history-controls">
+      <button id="history-start">Start</button>
+      <button id="history-stop">Stop</button>
+      <span class="history-status" id="history-status">idle</span>
+    </div>
+    <div class="history-table" id="history-table">
+      <div class="row header">
+        <div>timestamp</div>
+        <div>phase</div>
+        <div>prompt</div>
+        <div>completion</div>
+      </div>
+      <div id="history-rows"></div>
+    </div>
+  </details>
 </main>
 
 <script>
@@ -334,6 +393,112 @@ _HTML_TEMPLATE = r"""<!doctype html>
     sparklinePath.setAttribute("points", coords.join(" "));
     sparkTotal.textContent = String(points[points.length - 1] || 0);
     sparkPoints.textContent = points.length + " calls";
+  }
+
+  // ── v0.16 historical view — subscribes to /usage/history/stream ──
+  const historyStartBtn = document.getElementById("history-start");
+  const historyStopBtn = document.getElementById("history-stop");
+  const historyStatusEl = document.getElementById("history-status");
+  const historyRowsEl = document.getElementById("history-rows");
+  let historyAbortController = null;
+  const MAX_HISTORY_ROWS = 200;
+
+  historyStartBtn.addEventListener("click", startHistoryStream);
+  historyStopBtn.addEventListener("click", stopHistoryStream);
+
+  async function startHistoryStream() {
+    if (historyAbortController) return;
+    historyRowsEl.innerHTML = "";
+    historyStatusEl.textContent = "connecting...";
+    historyAbortController = new AbortController();
+    try {
+      const resp = await fetch(
+        "/usage/history/stream?poll_interval=1&initial_limit=50&max_duration=900",
+        { signal: historyAbortController.signal },
+      );
+      if (!resp.ok) {
+        if (resp.status === 503) {
+          historyStatusEl.textContent = "no --usage-db";
+        } else {
+          historyStatusEl.textContent = "HTTP " + resp.status;
+        }
+        historyAbortController = null;
+        return;
+      }
+      historyStatusEl.textContent = "streaming";
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          handleHistoryFrame(frame);
+        }
+      }
+      historyStatusEl.textContent = "closed";
+    } catch (err) {
+      if (err.name === "AbortError") {
+        historyStatusEl.textContent = "stopped";
+      } else {
+        historyStatusEl.textContent = "error: " + err.message;
+      }
+    } finally {
+      historyAbortController = null;
+    }
+  }
+
+  function stopHistoryStream() {
+    if (historyAbortController) {
+      historyAbortController.abort();
+    }
+  }
+
+  function handleHistoryFrame(frame) {
+    let eventName = "message";
+    let dataStr = "";
+    for (const line of frame.split("\n")) {
+      if (line.startsWith("event: ")) eventName = line.slice(7).trim();
+      else if (line.startsWith("data: ")) dataStr += line.slice(6);
+    }
+    if (!dataStr) return;
+    let data;
+    try { data = JSON.parse(dataStr); }
+    catch { return; }
+
+    if (eventName === "initial") {
+      for (const e of (data.events || [])) appendHistoryRow(e);
+    } else if (eventName === "event") {
+      appendHistoryRow(data);
+    } else if (eventName === "heartbeat") {
+      historyStatusEl.textContent =
+        "streaming (last seen " +
+        (data.last_seen ? new Date(data.last_seen * 1000).toLocaleTimeString() : "—") +
+        ")";
+    } else if (eventName === "done") {
+      historyStatusEl.textContent = "closed";
+    }
+  }
+
+  function appendHistoryRow(e) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const ts = new Date(e.timestamp * 1000).toISOString().replace("T", " ").slice(0, 19);
+    row.innerHTML =
+      '<div>' + escapeHtml(ts) + '</div>' +
+      '<div>' + escapeHtml(e.phase || "—") + '</div>' +
+      '<div>' + (e.prompt || 0) + '</div>' +
+      '<div>' + (e.completion || 0) + '</div>';
+    historyRowsEl.appendChild(row);
+    while (historyRowsEl.childElementCount > MAX_HISTORY_ROWS) {
+      historyRowsEl.removeChild(historyRowsEl.firstChild);
+    }
+    historyRowsEl.parentElement.scrollTop =
+      historyRowsEl.parentElement.scrollHeight;
   }
 })();
 </script>
