@@ -1,7 +1,7 @@
 /**
- * PageWiki Obsidian Plugin (v0.5)
+ * PageWiki Obsidian Plugin (v0.6)
  *
- * Wraps the pagewiki CLI so users can scan, ask, compile, and watch
+ * Wraps the pagewiki CLI so users can scan, ask, chat, compile, and watch
  * from within Obsidian — no terminal switching required.
  *
  * Commands are executed via Node child_process.exec against the
@@ -176,6 +176,205 @@ class AskModal extends Modal {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Chat Modal (v0.6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ChatMessage {
+	role: "user" | "assistant";
+	text: string;
+}
+
+class ChatModal extends Modal {
+	private settings: PageWikiSettings;
+	private messages: ChatMessage[] = [];
+	private messagesEl!: HTMLElement;
+	private inputEl!: HTMLTextAreaElement;
+	private submitBtn!: HTMLButtonElement;
+	private busy = false;
+
+	constructor(app: App, settings: PageWikiSettings) {
+		super(app);
+		this.settings = settings;
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.addClass("pagewiki-chat-modal");
+
+		contentEl.createEl("h2", { text: "PageWiki Chat" });
+		contentEl.createEl("p", {
+			text: `Model: ${this.settings.model} | Folder: ${this.settings.folder}`,
+			cls: "setting-item-description",
+		});
+
+		// Messages container
+		this.messagesEl = contentEl.createDiv({ cls: "pagewiki-chat-messages" });
+		this.messagesEl.style.maxHeight = "50vh";
+		this.messagesEl.style.overflowY = "auto";
+		this.messagesEl.style.marginBottom = "12px";
+		this.messagesEl.style.padding = "8px";
+		this.messagesEl.style.border = "1px solid var(--background-modifier-border)";
+		this.messagesEl.style.borderRadius = "6px";
+
+		this._appendSystemMessage("대화를 시작하세요. 후속 질문이 이전 맥락을 이어받습니다.");
+
+		// Input area
+		const inputWrapper = contentEl.createDiv();
+		inputWrapper.style.display = "flex";
+		inputWrapper.style.gap = "8px";
+
+		const ta = new TextAreaComponent(inputWrapper);
+		ta.setPlaceholder("질문을 입력하세요... (Enter 전송, Shift+Enter 줄바꿈)");
+		ta.inputEl.style.flex = "1";
+		ta.inputEl.style.height = "60px";
+		ta.inputEl.style.resize = "vertical";
+		this.inputEl = ta.inputEl;
+
+		this.submitBtn = inputWrapper.createEl("button", {
+			text: "Send",
+			cls: "mod-cta",
+		});
+		this.submitBtn.style.alignSelf = "flex-end";
+		this.submitBtn.addEventListener("click", () => this._handleSubmit());
+
+		this.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
+			if (e.key === "Enter" && !e.shiftKey) {
+				e.preventDefault();
+				this._handleSubmit();
+			}
+		});
+
+		this.inputEl.focus();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+
+	private _appendSystemMessage(text: string): void {
+		const el = this.messagesEl.createDiv({ cls: "pagewiki-chat-system" });
+		el.style.color = "var(--text-muted)";
+		el.style.fontStyle = "italic";
+		el.style.fontSize = "12px";
+		el.style.marginBottom = "8px";
+		el.setText(text);
+	}
+
+	private _appendMessage(msg: ChatMessage): void {
+		this.messages.push(msg);
+
+		const wrapper = this.messagesEl.createDiv({ cls: "pagewiki-chat-msg" });
+		wrapper.style.marginBottom = "12px";
+
+		const label = wrapper.createEl("strong");
+		label.style.color = msg.role === "user"
+			? "var(--text-accent)"
+			: "var(--text-success)";
+		label.setText(msg.role === "user" ? "Q: " : "A: ");
+
+		const body = wrapper.createEl("span");
+		body.style.whiteSpace = "pre-wrap";
+		body.setText(msg.text);
+
+		this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+	}
+
+	private _buildContextQuery(query: string): string {
+		// Prepend recent history as context so the single `ask` call
+		// can benefit from prior turns. Limited to last 3 turns.
+		if (this.messages.length === 0) return query;
+
+		const pairs: string[] = [];
+		const msgs = this.messages;
+		let i = msgs.length - 1;
+		let turns = 0;
+		while (i >= 0 && turns < 3) {
+			if (msgs[i].role === "assistant" && i > 0 && msgs[i - 1].role === "user") {
+				pairs.unshift(`Previous Q: ${msgs[i - 1].text}\nPrevious A: ${msgs[i].text.substring(0, 300)}`);
+				i -= 2;
+				turns++;
+			} else {
+				i--;
+			}
+		}
+
+		if (pairs.length === 0) return query;
+		return `[대화 맥락]\n${pairs.join("\n\n")}\n\n[현재 질문]\n${query}`;
+	}
+
+	private async _handleSubmit(): Promise<void> {
+		const query = this.inputEl.value.trim();
+		if (!query || this.busy) return;
+
+		this.inputEl.value = "";
+		this._appendMessage({ role: "user", text: query });
+
+		this.busy = true;
+		this.submitBtn.setText("...");
+		this.submitBtn.disabled = true;
+
+		try {
+			const contextQuery = this._buildContextQuery(query);
+			const escaped = contextQuery.replace(/"/g, '\\"');
+			const args =
+				`ask "${escaped}" --folder "${this.settings.folder}" ` +
+				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx}`;
+			const output = await runPagewiki(this.app, this.settings, args);
+
+			// Extract the answer line from CLI output (after "A: ")
+			const answer = this._extractAnswer(output);
+			this._appendMessage({ role: "assistant", text: answer });
+		} catch (e: any) {
+			this._appendSystemMessage(`Error: ${e.message}`);
+		} finally {
+			this.busy = false;
+			this.submitBtn.setText("Send");
+			this.submitBtn.disabled = false;
+			this.inputEl.focus();
+		}
+	}
+
+	/** Parse the answer from pagewiki ask CLI output. */
+	private _extractAnswer(output: string): string {
+		const lines = output.split("\n");
+		let answerStart = -1;
+		let citedStart = -1;
+
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i].startsWith("A: ") || lines[i].startsWith("A:")) {
+				answerStart = i;
+			}
+			if (lines[i].startsWith("Cited nodes:") || lines[i].startsWith("Cited:")) {
+				citedStart = i;
+				break;
+			}
+		}
+
+		if (answerStart === -1) return output.trim();
+
+		const endIdx = citedStart !== -1 ? citedStart : lines.length;
+		const answerLines = lines.slice(answerStart, endIdx);
+
+		// Strip the "A: " prefix from the first line
+		if (answerLines.length > 0) {
+			answerLines[0] = answerLines[0].replace(/^A:\s*/, "");
+		}
+
+		let answer = answerLines.join("\n").trim();
+
+		// Append cited nodes if present
+		if (citedStart !== -1) {
+			const citedLines = lines.slice(citedStart).filter((l) => l.trim());
+			if (citedLines.length > 1) {
+				answer += "\n\n" + citedLines.join("\n");
+			}
+		}
+
+		return answer || output.trim();
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Settings Tab
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -255,9 +454,15 @@ class PageWikiSettingTab extends PluginSettingTab {
 
 export default class PageWikiPlugin extends Plugin {
 	settings: PageWikiSettings = DEFAULT_SETTINGS;
+	private statusBarEl: HTMLElement | null = null;
+	private watchInterval: ReturnType<typeof setInterval> | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
+
+		// Status bar item for watch mode
+		this.statusBarEl = this.addStatusBarItem();
+		this.statusBarEl.setText("PageWiki: idle");
 
 		// Command: Scan
 		this.addCommand({
@@ -280,6 +485,13 @@ export default class PageWikiPlugin extends Plugin {
 			callback: () => this.openAskModal(),
 		});
 
+		// Command: Chat (v0.6)
+		this.addCommand({
+			id: "pagewiki-chat",
+			name: "Chat (multi-turn conversation)",
+			callback: () => this.openChatModal(),
+		});
+
 		// Command: Compile LLM-Wiki
 		this.addCommand({
 			id: "pagewiki-compile",
@@ -294,6 +506,13 @@ export default class PageWikiPlugin extends Plugin {
 			callback: () => this.runVaults(),
 		});
 
+		// Command: Toggle watch mode
+		this.addCommand({
+			id: "pagewiki-watch-toggle",
+			name: "Toggle watch mode",
+			callback: () => this.toggleWatch(),
+		});
+
 		// Settings tab
 		this.addSettingTab(new PageWikiSettingTab(this.app, this));
 
@@ -301,6 +520,10 @@ export default class PageWikiPlugin extends Plugin {
 		this.addRibbonIcon("search", "PageWiki Ask", () => {
 			this.openAskModal();
 		});
+	}
+
+	onunload(): void {
+		this.stopWatch();
 	}
 
 	async loadSettings(): Promise<void> {
@@ -327,6 +550,10 @@ export default class PageWikiPlugin extends Plugin {
 
 	private openAskModal(): void {
 		new AskModal(this.app, this.settings, (query) => this.runAsk(query)).open();
+	}
+
+	private openChatModal(): void {
+		new ChatModal(this.app, this.settings).open();
 	}
 
 	private async runAsk(query: string): Promise<void> {
@@ -362,8 +589,6 @@ export default class PageWikiPlugin extends Plugin {
 
 	private async runVaults(): Promise<void> {
 		try {
-			// vaults command doesn't need --vault
-			const vaultPath = (this.app.vault.adapter as any).basePath as string;
 			const cmd = `${this.settings.pythonPath} -m pagewiki vaults`;
 			const output = await new Promise<string>((resolve, reject) => {
 				exec(
@@ -378,6 +603,117 @@ export default class PageWikiPlugin extends Plugin {
 			new ResultModal(this.app, "Discovered Vaults", output).open();
 		} catch (e: any) {
 			new Notice(`PageWiki vaults failed: ${e.message}`, 10000);
+		}
+	}
+
+	private toggleWatch(): void {
+		if (this.watchInterval) {
+			this.stopWatch();
+			new Notice("PageWiki: Watch stopped");
+		} else {
+			this.startWatch();
+			new Notice("PageWiki: Watch started");
+		}
+	}
+
+	/** Build the env dict used by watch commands — passes vault/folder
+	 *  via environment variables so special characters (apostrophes,
+	 *  spaces, backslashes) never break the embedded Python string. */
+	private _watchEnv(): Record<string, string> {
+		const vaultPath = (this.app.vault.adapter as any).basePath as string;
+		return {
+			...process.env as Record<string, string>,
+			NO_COLOR: "1",
+			PAGEWIKI_VAULT: vaultPath,
+			PAGEWIKI_FOLDER: this.settings.folder || "",
+		};
+	}
+
+	/** Seed ``scan-state.json`` so the first poll only reports real deltas. */
+	private _seedSnapshot(): Promise<void> {
+		const cmd =
+			`${this.settings.pythonPath} -c "` +
+			`import os; from pathlib import Path; ` +
+			`from pagewiki.watcher import save_state; ` +
+			`save_state(Path(os.environ['PAGEWIKI_VAULT']), os.environ.get('PAGEWIKI_FOLDER') or None)"`;
+
+		return new Promise((resolve, reject) => {
+			exec(
+				cmd,
+				{ timeout: 30_000, env: this._watchEnv() },
+				(error, _stdout, stderr) => {
+					if (error) reject(new Error(stderr || error.message));
+					else resolve();
+				},
+			);
+		});
+	}
+
+	private async startWatch(): Promise<void> {
+		if (this.watchInterval) return;
+
+		// Seed the mtime snapshot before polling so the first cycle
+		// only reports actual deltas, not the entire vault as "added".
+		try {
+			await this._seedSnapshot();
+		} catch {
+			new Notice("PageWiki: failed to seed watch snapshot", 5000);
+		}
+
+		if (this.statusBarEl) {
+			this.statusBarEl.setText("PageWiki: watching");
+			this.statusBarEl.style.color = "var(--text-success)";
+		}
+
+		this.watchInterval = setInterval(async () => {
+			try {
+				const cmd =
+					`${this.settings.pythonPath} -c "` +
+					`import os; from pathlib import Path; ` +
+					`from pagewiki.watcher import detect_changes, save_state; ` +
+					`v = Path(os.environ['PAGEWIKI_VAULT']); ` +
+					`f = os.environ.get('PAGEWIKI_FOLDER') or None; ` +
+					`cs = detect_changes(v, f); ` +
+					`print(f'{len(cs.added)}|{len(cs.modified)}|{len(cs.deleted)}'); ` +
+					`save_state(v, f) if cs.has_changes else None"`;
+
+				const output = await new Promise<string>((resolve, reject) => {
+					exec(
+						cmd,
+						{ timeout: 15_000, env: this._watchEnv() },
+						(error, stdout, stderr) => {
+							if (error) reject(new Error(stderr || error.message));
+							else resolve(stdout.trim());
+						},
+					);
+				});
+
+				const [added, modified, deleted] = output.split("|").map(Number);
+				const total = added + modified + deleted;
+
+				if (total > 0 && this.statusBarEl) {
+					this.statusBarEl.setText(
+						`PageWiki: +${added} ~${modified} -${deleted}`,
+					);
+					new Notice(
+						`PageWiki: ${total} file(s) changed (${added} new, ${modified} modified, ${deleted} deleted)`,
+						5000,
+					);
+				}
+			} catch {
+				// Silently ignore poll errors
+			}
+		}, 10_000);
+	}
+
+	private stopWatch(): void {
+		if (this.watchInterval) {
+			clearInterval(this.watchInterval);
+			this.watchInterval = null;
+		}
+		if (this.statusBarEl) {
+			this.statusBarEl.setText("PageWiki: idle");
+			this.statusBarEl.style.color = "";
 		}
 	}
 }

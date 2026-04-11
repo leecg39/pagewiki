@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from pagewiki.retrieval import RetrievalResult, run_retrieval
+from pagewiki.retrieval import run_retrieval
 from pagewiki.vault import scan_folder
 from pagewiki.wiki_links import build_link_index
 

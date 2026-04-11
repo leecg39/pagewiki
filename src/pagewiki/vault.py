@@ -17,7 +17,8 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 
-from .cache import TreeCache
+from .cache import SummaryCache, TreeCache
+from .frontmatter import parse_frontmatter
 from .pageindex_adapter import build_long_note_subtree
 from .prompts import atomic_summary_prompt
 from .tree import NoteTier, TreeNode
@@ -65,6 +66,8 @@ def _note_to_node(path: Path, vault_root: Path) -> TreeNode:
     tier = classify(tokens)
     rel = path.relative_to(vault_root)
 
+    fm = parse_frontmatter(text)
+
     return TreeNode(
         node_id=str(rel),
         title=path.stem,
@@ -73,6 +76,9 @@ def _note_to_node(path: Path, vault_root: Path) -> TreeNode:
         file_path=path,
         token_count=tokens,
         wiki_links=extract_wiki_links(text),
+        tags=fm.tags,
+        date=fm.date,
+        aliases=fm.aliases,
     )
 
 
@@ -121,6 +127,8 @@ def summarize_atomic_notes(
     chat_fn: ChatFn,
     *,
     skip_existing: bool = True,
+    summary_cache: SummaryCache | None = None,
+    model_id: str | None = None,
 ) -> int:
     """Fill in one-line summaries for every tier=ATOMIC note under `root`.
 
@@ -133,6 +141,11 @@ def summarize_atomic_notes(
         chat_fn: LLM callable (production: ollama_client.chat wrapper).
         skip_existing: If True, don't re-summarize notes that already have a
             non-empty `summary` field. Enables cheap incremental re-runs.
+        summary_cache: Optional on-disk cache. When provided, summaries are
+            loaded from cache if the source note is unchanged, avoiding
+            redundant LLM calls on repeated ``ask`` invocations.
+        model_id: LLM model identifier, required when ``summary_cache``
+            is provided (part of the cache key).
 
     Returns:
         Number of notes actually summarized (i.e. LLM calls made).
@@ -146,6 +159,13 @@ def summarize_atomic_notes(
         if node.file_path is None:
             continue
 
+        # Try the on-disk cache first (v0.6).
+        if summary_cache is not None and model_id is not None:
+            cached = summary_cache.load(node.file_path, model_id)
+            if cached is not None:
+                node.summary = cached
+                continue
+
         content = node.file_path.read_text(encoding="utf-8")
         prompt = atomic_summary_prompt(node.title, content)
         summary = chat_fn(prompt).strip()
@@ -153,6 +173,10 @@ def summarize_atomic_notes(
         summary = summary.strip("\"'").strip()
         node.summary = summary
         calls += 1
+
+        # Persist to cache for next run.
+        if summary_cache is not None and model_id is not None:
+            summary_cache.save(node.file_path, model_id, summary)
 
     return calls
 
@@ -210,12 +234,14 @@ def build_long_subtrees(
         node_title = node.title
         node_prefix = node.node_id
 
-        def _build() -> list[TreeNode]:
+        def _build(
+            _path=node_path, _title=node_title, _prefix=node_prefix
+        ) -> list[TreeNode]:
             return build_long_note_subtree(
-                node_path,
-                node_title,
+                _path,
+                _title,
                 chat_fn=chat_fn,
-                node_id_prefix=node_prefix,
+                node_id_prefix=_prefix,
             )
 
         children, hit = cache.load_or_build(node.file_path, model_id, _build)
@@ -226,3 +252,67 @@ def build_long_subtrees(
             built += 1
 
     return built, from_cache
+
+
+def filter_tree(
+    root: TreeNode,
+    *,
+    tags: list[str] | None = None,
+    after: str | None = None,
+    before: str | None = None,
+) -> TreeNode:
+    """Return a pruned copy of ``root`` keeping only notes that match filters.
+
+    Folder nodes are kept if they still have at least one matching
+    descendant after filtering. Section children inherit their parent
+    note's filter result.
+
+    Args:
+        tags: Keep notes whose ``tags`` field intersects with this set
+            (case-insensitive). ``None`` disables tag filtering.
+        after: Keep notes with ``date >= after`` (ISO prefix, e.g.
+            ``"2024-01"``). Notes without a date are *kept*.
+        before: Keep notes with ``date <= before``. Notes without a date
+            are *kept*.
+    """
+    if tags is None and after is None and before is None:
+        return root
+
+    tag_set = {t.lower() for t in tags} if tags else None
+
+    def _matches(node: TreeNode) -> bool:
+        if node.kind != "note":
+            return True  # folders handled by child presence
+
+        if tag_set is not None:
+            note_tags = {t.lower() for t in node.tags}
+            if not note_tags & tag_set:
+                return False
+
+        if node.date:
+            if after is not None and node.date < after:
+                return False
+            if before is not None and node.date > before:
+                return False
+
+        return True
+
+    def _prune(node: TreeNode) -> TreeNode | None:
+        if node.kind == "note":
+            return node if _matches(node) else None
+
+        # Folder: recursively prune children.
+        new_children = []
+        for child in node.children:
+            pruned = _prune(child)
+            if pruned is not None:
+                new_children.append(pruned)
+
+        if not new_children and node is not root:
+            return None
+
+        copy = node.model_copy(update={"children": new_children})
+        return copy
+
+    result = _prune(root)
+    return result if result is not None else root.model_copy(update={"children": []})

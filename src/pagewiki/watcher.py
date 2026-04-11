@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -187,7 +188,7 @@ def watch_loop(
     subfolder: str | None = None,
     *,
     interval: int = DEFAULT_POLL_INTERVAL,
-    callback: "callable[[ChangeSet], None] | None" = None,
+    callback: Callable[[ChangeSet], None] | None = None,
     max_cycles: int | None = None,
 ) -> None:
     """Poll-based file watcher loop.

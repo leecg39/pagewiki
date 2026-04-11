@@ -24,14 +24,16 @@ from .prompts import (
     NodeSummary,
     evaluate_prompt,
     final_answer_prompt,
+    final_answer_with_history_prompt,
     parse_evaluate_response,
     parse_select_response,
     select_node_prompt,
 )
-from .tree import NoteTier, TreeNode
+from .tree import TreeNode
 from .wiki_links import LinkIndex, build_link_index
 
 ChatFn = Callable[[str], str]
+EventCallback = Callable[["TraceStep"], None] | None
 
 # Safety caps — prevent runaway LLM costs on pathological trees
 DEFAULT_MAX_ITERATIONS = 5
@@ -43,7 +45,7 @@ DEFAULT_MAX_NOTE_CHARS = 20_000
 class TraceStep:
     """Single step in the reasoning trace — useful for logging and debugging."""
 
-    phase: str  # "select" | "evaluate" | "finalize"
+    phase: str  # "select" | "evaluate" | "finalize" | "cross-ref"
     node_id: str | None
     detail: str
 
@@ -71,6 +73,8 @@ def _node_as_summary(
         summary=node.summary,
         token_count=node.token_count,
         linked_from=linked_from,
+        tags=node.tags or None,
+        date=node.date,
     )
 
 
@@ -134,6 +138,8 @@ def run_retrieval(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     max_gathered: int = DEFAULT_MAX_GATHERED_NOTES,
     link_index: LinkIndex | None = None,
+    on_event: EventCallback = None,
+    history: list[tuple[str, str]] | None = None,
 ) -> RetrievalResult:
     """Run the multi-hop reasoning loop.
 
@@ -149,11 +155,19 @@ def run_retrieval(
             automatically from ``root``. Pass a pre-built index to avoid
             redundant I/O when the caller (e.g. ``cli.ask``) has already
             built one.
+        on_event: Optional callback invoked for each ``TraceStep`` as it
+            is recorded. Used by the CLI to stream progress in real-time.
 
     Returns:
         RetrievalResult with answer, cited node ids, and reasoning trace.
     """
     trace: list[TraceStep] = []
+
+    def _record(step: TraceStep) -> None:
+        trace.append(step)
+        if on_event is not None:
+            on_event(step)
+
     gathered: list[tuple[str, str]] = []  # (title, content)
     cited: list[str] = []
     visited_ids: set[str] = set()
@@ -221,20 +235,20 @@ def run_retrieval(
         try:
             action, value = parse_select_response(response)
         except ValueError as e:
-            trace.append(TraceStep("select", None, f"parse error: {e}"))
+            _record(TraceStep("select", None, f"parse error: {e}"))
             done_reason = f"응답 파싱 실패: {e}"
             break
 
         if action == "DONE":
-            trace.append(TraceStep("select", None, f"DONE: {value}"))
+            _record(TraceStep("select", None, f"DONE: {value}"))
             done_reason = value
             break
 
         # action == "SELECT"
         picked = next((c for c in candidates if c.node_id == value), None)
         if picked is None:
-            trace.append(
-                TraceStep("select", value, f"invalid node_id (not in candidates)")
+            _record(
+                TraceStep("select", value, "invalid node_id (not in candidates)")
             )
             # Mark visited to avoid re-offering and retry the loop
             visited_ids.add(value)
@@ -242,7 +256,7 @@ def run_retrieval(
 
         visited_ids.add(picked.node_id)
         is_xref = value in cross_ref_pool
-        trace.append(
+        _record(
             TraceStep(
                 "select",
                 picked.node_id,
@@ -274,7 +288,7 @@ def run_retrieval(
         # picked.kind == "note" (leaf) or "section" — Phase 3: Extract & Evaluate
         content = _load_note_content(picked)
         if not content:
-            trace.append(TraceStep("evaluate", picked.node_id, "empty content"))
+            _record(TraceStep("evaluate", picked.node_id, "empty content"))
             continue
 
         eval_prompt = evaluate_prompt(query, picked.title, content)
@@ -282,7 +296,7 @@ def run_retrieval(
         try:
             sufficient, reason = parse_evaluate_response(eval_response)
         except ValueError as e:
-            trace.append(TraceStep("evaluate", picked.node_id, f"parse error: {e}"))
+            _record(TraceStep("evaluate", picked.node_id, f"parse error: {e}"))
             # Treat parse failure as "gather this and keep going"
             gathered.append((picked.title, content))
             cited.append(picked.node_id)
@@ -290,7 +304,7 @@ def run_retrieval(
 
         gathered.append((picked.title, content))
         cited.append(picked.node_id)
-        trace.append(
+        _record(
             TraceStep(
                 "evaluate",
                 picked.node_id,
@@ -312,7 +326,7 @@ def run_retrieval(
             if target.node_id not in visited_ids and target.node_id not in cross_ref_pool:
                 label = f"{Path(source_note_id).stem} → [[{link.raw_target}]]"
                 cross_ref_pool[target.node_id] = (target, label)
-                trace.append(
+                _record(
                     TraceStep(
                         "cross-ref",
                         target.node_id,
@@ -330,11 +344,14 @@ def run_retrieval(
             f"[근거 부족] 탐색 결과 관련 노트를 찾지 못했습니다. "
             f"이유: {done_reason or '후보 소진'}"
         )
+    elif history:
+        final_prompt = final_answer_with_history_prompt(query, gathered, history)
+        answer = chat_fn(final_prompt).strip()
     else:
         final_prompt = final_answer_prompt(query, gathered)
         answer = chat_fn(final_prompt).strip()
 
-    trace.append(
+    _record(
         TraceStep(
             "finalize",
             None,

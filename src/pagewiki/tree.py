@@ -6,14 +6,14 @@ Mirrors the PageIndex node format but extends it with Obsidian-specific fields
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
-class NoteTier(str, Enum):
+class NoteTier(StrEnum):
     """3-tier classification from docs/ARCHITECTURE.md §3."""
 
     MICRO = "micro"  # < 500 tokens — title-only leaf
@@ -38,6 +38,11 @@ class TreeNode(BaseModel):
     file_path: Path | None = None
     token_count: int | None = None
     wiki_links: list[str] = Field(default_factory=list)
+
+    # Frontmatter metadata (v0.6)
+    tags: list[str] = Field(default_factory=list)
+    date: str | None = None
+    aliases: list[str] = Field(default_factory=list)
 
     # PageIndex-compatible (Layer 2)
     # For PDF sources: (start_page, end_page). Unused in markdown mode.

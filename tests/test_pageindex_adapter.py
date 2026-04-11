@@ -17,7 +17,6 @@ from pagewiki.pageindex_adapter import (
     build_long_note_subtree,
 )
 
-
 # Reusable sample markdown with a three-level heading structure. The
 # body of section "1. Intro" is kept short so thinning will merge it;
 # sections 2 and 3 are large enough to survive.

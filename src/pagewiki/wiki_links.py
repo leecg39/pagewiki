@@ -317,7 +317,7 @@ def _compute_stats(
         return target.title
 
     incoming_per_title: dict[str, int] = defaultdict(int)
-    for target_id, links in backlinks.items():
+    for _target_id, links in backlinks.items():
         if not links:
             continue
         # All entries under this key share the same target node by
@@ -329,7 +329,7 @@ def _compute_stats(
     )[:top_n]
 
     outgoing_per_title: dict[str, int] = defaultdict(int)
-    for source_id, links in outgoing.items():
+    for _source_id, links in outgoing.items():
         if not links:
             continue
         # source is always a note (``build_link_index`` iterates notes

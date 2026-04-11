@@ -14,7 +14,7 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                      pagewiki CLI                            │
-│         (scan / ask — src/pagewiki/cli.py)                   │
+│     (scan / ask / chat / compile / watch — cli.py)           │
 └──────────────┬───────────────────────────────┬───────────────┘
                │                               │
                ▼                               ▼
@@ -62,6 +62,7 @@
 - **kind**: `folder` | `note`
 - **tier**: `MICRO` | `ATOMIC` | `LONG` (3절 참고)
 - **wiki_links**: 노트 본문에서 추출한 `[[target]]` 리스트
+- **tags** / **date** / **aliases**: YAML frontmatter에서 파싱 (v0.6)
 
 ### Layer 2: Note Tree (PageIndex SDK 위임)
 
@@ -135,14 +136,26 @@ pagewiki/
 │   └── ARCHITECTURE.md  ← 이 파일
 ├── src/pagewiki/
 │   ├── __init__.py
-│   ├── cli.py                # Click CLI
+│   ├── cli.py                # Click CLI (scan/ask/chat/compile/watch/vaults)
 │   ├── tree.py               # TreeNode pydantic 모델
-│   ├── vault.py              # Layer 1 스캐너 + 분류기
+│   ├── vault.py              # Layer 1 스캐너 + 분류기 + filter_tree
 │   ├── pageindex_adapter.py  # Layer 2 어댑터
+│   ├── retrieval.py          # Multi-hop reasoning 루프 (on_event 스트리밍)
+│   ├── prompts.py            # 프롬프트 템플릿 (select/evaluate/final/chat)
+│   ├── frontmatter.py        # YAML frontmatter 파서 (v0.6)
+│   ├── cache.py              # TreeCache + SummaryCache (v0.6)
+│   ├── wiki_links.py         # [[wiki-link]] 인덱스 + 교차참조
+│   ├── compile.py            # LLM-Wiki 컴파일러 (entity → wiki)
+│   ├── watcher.py            # mtime 기반 파일 변경 감지
+│   ├── obsidian_config.py    # 볼트 자동 발견 (notesmd-cli / obsidian.json)
 │   ├── ollama_client.py      # LiteLLM + Ollama 래퍼
-│   └── logger.py             # QueryRecord → .pagewiki-log
-└── tests/
-    └── test_vault.py         # Layer 1 단위 테스트
+│   ├── logger.py             # QueryRecord → .pagewiki-log
+│   └── _vendor/pageindex/    # 번들된 PageIndex SDK (MIT)
+├── obsidian-plugin/
+│   ├── main.ts               # Obsidian 플러그인 (Scan/Ask/Chat/Compile/Watch)
+│   ├── manifest.json
+│   └── styles.css
+└── tests/                    # 185+ 테스트
 ```
 
 ## 6. 의존성
@@ -171,9 +184,10 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 - Ollama (`brew install ollama`)
 - `gemma4:26b` (64GB RAM Mac 기준 기본), `gemma4:e4b` (16GB 폴백)
 
-**Layer 2 캐시**: `{vault}/.pagewiki-cache/trees/{sha1}.json`. 캐시 키는
-`(abs_path, mtime_ns, model_id, adapter_version)` 4요소이며 하나라도
-바뀌면 재빌드된다. `rm -rf .pagewiki-cache` 안전 (idempotent).
+**캐시** (`{vault}/.pagewiki-cache/`):
+- `trees/{sha1}.json` — Layer 2 서브트리. 키: `(abs_path, mtime_ns, model_id, adapter_version)`
+- `summaries/{sha1}.json` — ATOMIC 노트 요약 (v0.6). 키: `(abs_path, mtime_ns, model_id)`
+- 어느 쪽이든 키 불일치 시 자동 재빌드. `rm -rf .pagewiki-cache` 안전 (idempotent).
 
 ## 7. 로드맵
 
@@ -186,16 +200,44 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.1.4 | `[[wiki-link]]` resolution **index** + `scan --show-graph` (v0.2 Phase 1, PR #2) |
 | v0.1.5 | notesmd-cli 통합 — `--vault` auto-discovery, `pagewiki vaults` 서브커맨드, `ask` 출력에 `notesmd-cli open` 힌트 |
 | v0.2 | `[[wiki-link]]` retrieval traversal — 노트 평가 후 outgoing wiki-link 대상을 교차참조 후보로 자동 추가, 프롬프트에 `[교차참조]` 태그 표시, transitive chain following |
-| v0.3 | Karpathy LLM-Wiki compiler — `pagewiki compile` 서브커맨드, 2-pass 파이프라인 (entity 추출 → 위키 페이지 생성), `{vault}/LLM-Wiki/` 출력, `index.md` 카탈로그 + `log.md` 감사추적 |
-| v0.4 | 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 vault 파일 변경 실시간 감지, scan-state.json 기반 변경 추적 (added/modified/deleted), poll 기반 (외부 의존성 0) |
-| **v0.5** (현재) | **Obsidian 플러그인 UI** — `obsidian-plugin/`에 TypeScript 플러그인 제공, Command Palette에서 Scan/Ask/Compile/Vaults 실행, 결과 모달 + 클립보드 복사, Settings 탭에서 model/folder/python 경로 설정 |
-| v0.3 | Karpathy LLM-Wiki compiler (entity 추출 → `LLM-Wiki/` 폴더) |
-| v0.4 | 증분 재인덱싱 + mtime 기반 watcher |
-| v0.5 | Obsidian 플러그인 UI |
+| v0.3 | Karpathy LLM-Wiki compiler — `pagewiki compile` 서브커맨드, 2-pass 파이프라인 (entity 추출 → 위키 페이지 생성), `{vault}/LLM-Wiki/` 출력 |
+| v0.4 | 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 vault 파일 변경 실시간 감지 |
+| v0.5 | Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile/Watch 실행, Settings 탭, 결과 모달 |
+| **v0.6** (현재) | **대화형 모드 + 캐시 + 필터 + 스트리밍** — 아래 §7.1 상세 |
+| v0.7 (계획) | 병렬 LLM + 멀티쿼리 분해 + API 서버 — 아래 §7.2 상세 |
+
+### 7.1 v0.6 상세
+
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| `pagewiki chat` | cli.py, prompts.py, retrieval.py | 대화형 REPL. 후속 질문을 `rewrite_query_with_context()`로 독립 질문으로 재작성, `final_answer_with_history_prompt()`로 이전 대화 맥락 반영 |
+| Atomic summary cache | cache.py `SummaryCache` | ATOMIC 노트 요약을 `.pagewiki-cache/summaries/`에 디스크 캐시. TreeCache와 동일한 `(abs_path, mtime_ns, model_id)` 무효화 |
+| Frontmatter 필터 | frontmatter.py, vault.py `filter_tree()` | YAML frontmatter(tags, date, aliases) 파싱 → TreeNode 필드. `--tag`/`--after`/`--before` CLI 옵션으로 트리 사전 가지치기 |
+| 실시간 스트리밍 | retrieval.py `on_event`, cli.py | `run_retrieval()`에 `EventCallback` 추가. SELECT/EVAL/XREF/DONE 단계를 실시간 표시 |
+
+### 7.2 v0.7 계획
+
+**병렬 LLM 호출** (high impact):
+- 현재 `summarize_atomic_notes()`와 `compile` 파이프라인은 노트당 1회 순차 LLM 호출
+- `concurrent.futures.ThreadPoolExecutor`로 병렬화 (Ollama는 동시 요청 지원)
+- 예상 효과: 50 ATOMIC 노트 요약 시간 50x → 5x 수준으로 단축
+
+**멀티쿼리 분해** (medium impact):
+- 복합 질문을 LLM으로 서브쿼리로 분해 → 각각 `run_retrieval()` → 결과 합성
+- "X와 Y의 차이점은?" → Sub-Q1: "X란?", Sub-Q2: "Y란?", Sub-Q3: "차이점 비교"
+
+**API 서버 모드** (medium impact, high effort):
+- FastAPI 기반 `pagewiki serve` 명령
+- `POST /ask`, `POST /chat` 엔드포인트 + 세션 관리
+- 트리/캐시를 서버 기동 시 1회 로드 → 반복 쿼리 시 스캔 오버헤드 제거
+
+**멀티 vault 지원** (medium impact, high effort):
+- `--vault` 복수 지정 또는 `--vault-all` 옵션
+- 각 vault의 TreeNode를 가상 루트 아래 병합
+- `node_id`에 vault 네임스페이스 추가 (충돌 방지)
 
 ## 8. 명시적 비목표 (Non-Goals)
 
-- ❌ 실시간 채팅 UI (쿼리당 60~300초 레이턴시)
 - ❌ 수백만 문서 스케일 (볼트 수천~수만 노트 대상)
 - ❌ 벡터 DB 하이브리드 (순수 vectorless 유지)
 - ❌ 클라우드 LLM 지원 (로컬 프라이버시 우선)
