@@ -211,7 +211,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.7 | 병렬 LLM + 멀티쿼리 분해 + 멀티 vault + API 서버 — 아래 §7.2 상세 |
 | v0.8 | 토큰 사용량 추적 + 파싱 재시도 + BM25 사전 랭킹 — 아래 §7.3 상세 |
 | v0.9 | 토큰 예산 + chat usage + /usage endpoint + cited 재정렬 — 아래 §7.4 상세 |
-| **v0.10** (현재) | **JSON-mode + SQLite usage + SSE 스트리밍 + context reuse** — 아래 §7.5 상세 |
+| v0.10 | JSON-mode + SQLite usage + SSE 스트리밍 + context reuse — 아래 §7.5 상세 |
+| **v0.11** (현재) | **/chat/stream + usage 이벤트 + per-vault 캐시 + usage-report CLI** — 아래 §7.6 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -270,12 +271,23 @@ DELETE /chat/{sid}      # 세션 삭제
 | SSE 스트리밍 | server.py `POST /ask/stream` | `fastapi.StreamingResponse`로 SSE 이벤트 반환. `trace` 이벤트 (TraceStep당 하나) → `answer` 이벤트 (최종 답변 + cited). 동기 retrieval loop을 `threading.Thread` + `queue.Queue`로 async generator에 bridge. |
 | Context reuse | retrieval.py `shown_ids` + `reuse_context` | 각 iteration에서 후보 목록에 등장한 모든 node_id를 추적. `reuse_context=True`일 때 이후 iteration에서는 이미 보여준 후보를 자동 제거 → 프롬프트 길이 감소. path_so_far가 3단계 넘으면 `...(생략)` 프리픽스로 truncate. CLI `ask --reuse-context`. |
 
-### 7.6 v0.11+ 향후 계획
+### 7.6 v0.11 상세
 
-- 쿼리당 `--max-tokens` 예산 분배 로직 (summarize vs retrieve 비율 조정)
-- `/ask/stream`에 usage 이벤트 추가 (실시간 예산 표시)
-- 대화형 chat 모드에도 SSE 스트리밍 지원
-- 멀티 vault에서 per-vault 캐시 분리 (현재는 primary vault로 통합)
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| `/chat/stream` SSE | server.py `_stream_retrieval` + `chat_stream` | `/ask/stream`과 같은 threading + queue 패턴을 공유하는 헬퍼로 통합. `ChatSession` 히스토리가 `run_retrieval(history=...)`로 전달. 종료 이벤트에 `session_id`, `turn` 포함. 세션은 서버 state에서 관리, 1시간 비활성 시 만료. |
+| Usage 이벤트 SSE | server.py `_stream_retrieval` | 각 trace step 직후 `event: usage` 프레임을 emit. per-request `UsageTracker`로 cumulative counts를 계산해 `{total_calls, prompt_tokens, completion_tokens, total_tokens, elapsed}` JSON 반환. 클라이언트가 실시간 토큰 미터 표시 가능. |
+| Per-vault 캐시 | vault.py `vault_for_note`, `build_long_subtrees_multi`, `summarize_atomic_notes_multi` | 멀티 vault에서 각 노트의 `file_path`로 소속 vault를 찾아 해당 vault의 `TreeCache`/`SummaryCache`에 기록. 기존에는 primary vault의 `.pagewiki-cache/`로 통합되던 것을 vault별로 분리. longest-match 라우팅으로 중첩 vault도 올바르게 처리. |
+| `pagewiki usage-report` | cli.py `usage_report` 커맨드 | SQLite 사용량 DB 조회 CLI. `--since`/`--until`/`--phase`/`--recent` 필터. phase별 breakdown Rich 테이블 + 최근 이벤트 리스트. `serve --usage-db`와 페어링. |
+| compile 토큰 추적 | cli.py `compile` | `--usage`/`--usage-db` 플래그 추가. `_make_chat_fn`에 tracker + store 주입해 entity extraction/page generation 양쪽 phase의 토큰 사용량 집계. |
+| Obsidian plugin v0.10 catch-up | obsidian-plugin/main.ts | 누락됐던 v0.8~v0.10 flag (`--usage`, `--max-tokens`, `--json-mode`, `--reuse-context`) 모두 설정 탭 + runAsk/ChatModal에 연결. |
+
+### 7.7 v0.12+ 향후 계획
+
+- `/ask/stream` + `/chat/stream`을 WebSocket으로 확장 (양방향 interrupt 지원)
+- Usage persistence에 daily rollup 테이블 추가 (대용량 DB 쿼리 가속)
+- 멀티 vault에서 per-vault 별도 retrieval 루프 + cross-vault 답변 merging
+- Obsidian plugin의 `/chat/stream` 직접 소비 (현재는 CLI subprocess 경유)
 
 ## 8. 명시적 비목표 (Non-Goals)
 

@@ -188,7 +188,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.10.0")
+    app = FastAPI(title="pagewiki API", version="0.11.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -289,7 +289,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.10.0",
+            "version": "0.11.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -403,28 +403,39 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         state.tracker.events.clear()
         return {"status": "reset"}
 
-    # ── v0.10 SSE streaming endpoint ──────────────────────────────────────
+    # ── v0.10/v0.11 SSE streaming endpoints ───────────────────────────────
 
-    @app.post("/ask/stream")
-    def ask_stream(req: AskRequest = Body(...)):  # noqa: B008
-        """Stream retrieval events as Server-Sent Events (v0.10).
+    def _stream_retrieval(
+        query: str,
+        *,
+        decompose: bool,
+        tags: list[str] | None,
+        after: str | None,
+        before: str | None,
+        history: list[tuple[str, str]] | None,
+        session: "ChatSession | None",
+        include_session: bool,
+    ):
+        """Shared SSE streaming worker used by /ask/stream and /chat/stream.
 
-        Events:
+        Spawns a background thread that runs retrieval, bridges
+        ``TraceStep`` events to an SSE-friendly generator, and
+        emits live ``usage`` deltas between iterations (v0.11).
 
-          * ``trace``  — one per ``TraceStep`` emitted by the loop
-          * ``answer`` — the final answer + cited nodes
-          * ``error``  — unexpected exceptions during retrieval
-
-        The retrieval loop is synchronous, so we run it on a
-        ThreadPoolExecutor and bridge events through a
-        ``queue.Queue``. FastAPI's ``StreamingResponse`` yields the
-        events to the client as they arrive.
+        When ``session`` is provided, the turn is recorded in the
+        session's history after retrieval completes.
         """
         import json as _json
         import queue
         import threading as _threading
 
         event_queue: queue.Queue[tuple[str, dict] | None] = queue.Queue()
+
+        # Per-request tracker so we can emit live deltas without
+        # interfering with the server-wide cumulative tracker.
+        # Writes to both — the shared tracker stays authoritative
+        # for /usage, while this local one drives per-request SSE.
+        local_tracker = UsageTracker()
 
         def on_event(step: TraceStep) -> None:
             event_queue.put(
@@ -437,32 +448,76 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                     },
                 )
             )
+            # v0.11: emit a live usage snapshot after each trace so
+            # the client can show a running token meter.
+            event_queue.put(
+                (
+                    "usage",
+                    {
+                        "total_calls": local_tracker.total_calls,
+                        "prompt_tokens": local_tracker.total_prompt_tokens,
+                        "completion_tokens": local_tracker.total_completion_tokens,
+                        "total_tokens": local_tracker.total_tokens,
+                        "elapsed": local_tracker.total_elapsed,
+                    },
+                )
+            )
+
+        # Wrap the shared chat_fn so every call updates BOTH trackers.
+        # This keeps /usage's cumulative counts accurate while
+        # still giving the SSE client a per-request view.
+        import time as _time
+
+        def tracked_chat_fn(prompt: str) -> str:
+            t0 = _time.time()
+            response_text = state.chat_fn(prompt)
+            elapsed = _time.time() - t0
+            # Best-effort token estimate. The shared chat_fn has
+            # already recorded real counts into state.tracker;
+            # local_tracker uses char/3 estimates so the live delta
+            # is at least directionally accurate.
+            local_tracker.record(
+                "other",
+                max(1, len(prompt) // 3),
+                max(1, len(response_text) // 3),
+                elapsed,
+            )
+            return response_text
 
         def worker() -> None:
             try:
-                root = _filtered_root(req.tags, req.after, req.before)
-                if req.decompose:
+                root = _filtered_root(tags, after, before)
+                if decompose:
                     result = run_decomposed_retrieval(
-                        req.query, root, state.chat_fn,
+                        query, root, tracked_chat_fn,
                         link_index=state.link_index,
                         on_event=on_event,
                     )
                 else:
                     result = run_retrieval(
-                        req.query, root, state.chat_fn,
+                        query, root, tracked_chat_fn,
                         link_index=state.link_index,
                         on_event=on_event,
+                        history=history,
                     )
-                event_queue.put(
-                    (
-                        "answer",
-                        {
-                            "answer": result.answer,
-                            "cited_nodes": result.cited_nodes,
-                            "iterations_used": result.iterations_used,
-                        },
-                    )
-                )
+
+                answer_payload: dict = {
+                    "answer": result.answer,
+                    "cited_nodes": result.cited_nodes,
+                    "iterations_used": result.iterations_used,
+                    "usage": {
+                        "prompt_tokens": local_tracker.total_prompt_tokens,
+                        "completion_tokens": local_tracker.total_completion_tokens,
+                        "total_tokens": local_tracker.total_tokens,
+                    },
+                }
+
+                if include_session and session is not None:
+                    session.history.append((query, result.answer[:500]))
+                    answer_payload["session_id"] = session.sid
+                    answer_payload["turn"] = len(session.history)
+
+                event_queue.put(("answer", answer_payload))
             except Exception as exc:  # pragma: no cover — defensive
                 event_queue.put(("error", {"message": str(exc)}))
             finally:
@@ -487,6 +542,56 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
+        )
+
+    @app.post("/ask/stream")
+    def ask_stream(req: AskRequest = Body(...)):  # noqa: B008
+        """Stream retrieval events as Server-Sent Events (v0.10).
+
+        Events:
+
+          * ``trace``  — one per ``TraceStep`` emitted by the loop
+          * ``usage``  — cumulative token deltas after each step (v0.11)
+          * ``answer`` — the final answer + cited nodes + usage summary
+          * ``error``  — unexpected exceptions during retrieval
+        """
+        return _stream_retrieval(
+            req.query,
+            decompose=req.decompose,
+            tags=req.tags,
+            after=req.after,
+            before=req.before,
+            history=None,
+            session=None,
+            include_session=False,
+        )
+
+    @app.post("/chat/stream")
+    def chat_stream(req: ChatRequest = Body(...)):  # noqa: B008
+        """Stream chat retrieval with session history (v0.11).
+
+        Mirrors ``/ask/stream`` but threads the server-side
+        ``ChatSession`` through so follow-up questions see prior
+        turns. The final ``answer`` event includes the session_id
+        (new or reused) and turn number.
+        """
+        _prune_expired_sessions(state)
+        sid = req.session_id or uuid.uuid4().hex
+        session = state.sessions.get(sid)
+        if session is None:
+            session = ChatSession(sid=sid)
+            state.sessions[sid] = session
+        session.last_active = time.time()
+
+        return _stream_retrieval(
+            req.query,
+            decompose=req.decompose,
+            tags=None,
+            after=None,
+            before=None,
+            history=list(session.history),
+            session=session,
+            include_session=True,
         )
 
     return app

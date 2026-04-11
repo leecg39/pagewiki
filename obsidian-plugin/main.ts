@@ -1,5 +1,5 @@
 /**
- * PageWiki Obsidian Plugin (v0.7)
+ * PageWiki Obsidian Plugin (v0.11)
  *
  * Wraps the pagewiki CLI so users can scan, ask, chat, compile, and watch
  * from within Obsidian — no terminal switching required.
@@ -8,9 +8,12 @@
  * `pagewiki` CLI that the user has already pip-installed. Results
  * are displayed in Obsidian modals with Rich-markup stripped.
  *
- * v0.7 additions:
- *   - `maxWorkers` setting for parallel LLM calls
- *   - `decompose` toggle per-query for multi-sub-question retrieval
+ * Version history:
+ *   - v0.7: maxWorkers + decomposeByDefault
+ *   - v0.8: N/A (plugin-side)
+ *   - v0.9: --usage, --max-tokens flags
+ *   - v0.10: --json-mode, --reuse-context flags
+ *   - v0.11: Chat streaming (when pagewiki serve is reachable)
  */
 
 import {
@@ -35,6 +38,12 @@ interface PageWikiSettings {
 	pythonPath: string;
 	maxWorkers: number;
 	decomposeByDefault: boolean;
+	// v0.9
+	showUsage: boolean;
+	maxTokens: number;  // 0 = unlimited
+	// v0.10
+	jsonMode: boolean;
+	reuseContext: boolean;
 }
 
 const DEFAULT_SETTINGS: PageWikiSettings = {
@@ -44,6 +53,10 @@ const DEFAULT_SETTINGS: PageWikiSettings = {
 	pythonPath: "python",
 	maxWorkers: 4,
 	decomposeByDefault: false,
+	showUsage: false,
+	maxTokens: 0,
+	jsonMode: false,
+	reuseContext: false,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -361,6 +374,20 @@ class ChatModal extends Modal {
 			if (this.settings.decomposeByDefault) {
 				args += " --decompose";
 			}
+			// v0.9+ flags propagated from settings.
+			if (this.settings.showUsage) {
+				args += " --usage";
+			}
+			if (this.settings.maxTokens > 0) {
+				args += ` --max-tokens ${this.settings.maxTokens}`;
+			}
+			// v0.10+ flags.
+			if (this.settings.jsonMode) {
+				args += " --json-mode";
+			}
+			if (this.settings.reuseContext) {
+				args += " --reuse-context";
+			}
 			const output = await runPagewiki(this.app, this.settings, args);
 
 			// Extract the answer line from CLI output (after "A: ")
@@ -523,6 +550,77 @@ class PageWikiSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}),
 			);
+
+		// ── v0.9 settings ──────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "v0.9 Token Budget" });
+
+		new Setting(containerEl)
+			.setName("Show token usage")
+			.setDesc(
+				"Append --usage to Ask/Chat so the CLI prints a token " +
+				"usage breakdown after each query (v0.9).",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showUsage)
+					.onChange(async (value) => {
+						this.plugin.settings.showUsage = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Max tokens per query")
+			.setDesc(
+				"Hard cap on total tokens for one query. 0 = unlimited. " +
+				"Loop aborts cleanly when the cap is hit (v0.9).",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("0")
+					.setValue(String(this.plugin.settings.maxTokens))
+					.onChange(async (value) => {
+						const num = parseInt(value, 10);
+						if (!isNaN(num) && num >= 0) {
+							this.plugin.settings.maxTokens = num;
+							await this.plugin.saveSettings();
+						}
+					}),
+			);
+
+		// ── v0.10 settings ─────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "v0.10 Reliability & Efficiency" });
+
+		new Setting(containerEl)
+			.setName("JSON-mode prompts")
+			.setDesc(
+				"Ask the LLM to respond in strict JSON for SELECT/EVALUATE " +
+				"phases. Auto-falls-back to text parser if JSON fails twice " +
+				"(v0.10).",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.jsonMode)
+					.onChange(async (value) => {
+						this.plugin.settings.jsonMode = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Reuse context")
+			.setDesc(
+				"Compact path_so_far and suppress already-shown candidates " +
+				"on deep loops to shorten prompts (v0.10).",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.reuseContext)
+					.onChange(async (value) => {
+						this.plugin.settings.reuseContext = value;
+						await this.plugin.saveSettings();
+					}),
+			);
 	}
 }
 
@@ -649,6 +747,20 @@ export default class PageWikiPlugin extends Plugin {
 				`--max-workers ${this.settings.maxWorkers}`;
 			if (useDecompose) {
 				args += " --decompose";
+			}
+			// v0.9+ flags
+			if (this.settings.showUsage) {
+				args += " --usage";
+			}
+			if (this.settings.maxTokens > 0) {
+				args += ` --max-tokens ${this.settings.maxTokens}`;
+			}
+			// v0.10+ flags
+			if (this.settings.jsonMode) {
+				args += " --json-mode";
+			}
+			if (this.settings.reuseContext) {
+				args += " --reuse-context";
 			}
 			const output = await runPagewiki(this.app, this.settings, args);
 			notice.hide();

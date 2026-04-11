@@ -338,6 +338,168 @@ def scan_multi_vault(
     return multi_root
 
 
+def vault_for_note(note_path: Path, vault_roots: list[Path]) -> Path | None:
+    """Return the vault root whose directory contains ``note_path``.
+
+    Used in multi-vault mode (v0.11) so each note's cache entry
+    lands in the right vault's ``.pagewiki-cache/`` directory
+    instead of all pooling into the primary vault. Returns
+    ``None`` if no vault matches (defensive — caller should fall
+    back to the primary vault in that case).
+    """
+    try:
+        abs_note = note_path.expanduser().resolve()
+    except OSError:
+        return None
+
+    best_match: Path | None = None
+    best_len = -1
+    for vault in vault_roots:
+        try:
+            abs_vault = vault.expanduser().resolve()
+        except OSError:
+            continue
+        try:
+            abs_note.relative_to(abs_vault)
+        except ValueError:
+            continue
+        vlen = len(str(abs_vault))
+        if vlen > best_len:
+            best_match = vault
+            best_len = vlen
+    return best_match
+
+
+def build_long_subtrees_multi(
+    root: TreeNode,
+    *,
+    vault_roots: list[Path],
+    model_id: str,
+    chat_fn: ChatFn | None = None,
+    caches: dict[Path, TreeCache] | None = None,
+) -> tuple[int, int]:
+    """Multi-vault aware version of ``build_long_subtrees`` (v0.11).
+
+    Each LONG note is routed to the ``TreeCache`` of its owning
+    vault (determined by ``vault_for_note``). If no per-vault cache
+    is supplied for a note's vault, one is created lazily.
+
+    Falls back to the primary vault's cache for notes outside any
+    configured vault directory.
+    """
+    if caches is None:
+        caches = {}
+    for v in vault_roots:
+        if v not in caches:
+            caches[v] = TreeCache(v)
+
+    primary = vault_roots[0]
+    built = 0
+    from_cache = 0
+
+    for node in root.walk():
+        if node.kind != "note" or node.tier != NoteTier.LONG:
+            continue
+        if node.file_path is None:
+            continue
+
+        owning_vault = vault_for_note(node.file_path, vault_roots) or primary
+        cache = caches[owning_vault]
+
+        node_path = node.file_path
+        node_title = node.title
+        node_prefix = node.node_id
+
+        def _build(
+            _path=node_path, _title=node_title, _prefix=node_prefix
+        ) -> list[TreeNode]:
+            return build_long_note_subtree(
+                _path,
+                _title,
+                chat_fn=chat_fn,
+                node_id_prefix=_prefix,
+            )
+
+        children, hit = cache.load_or_build(node.file_path, model_id, _build)
+        node.children = children
+        if hit:
+            from_cache += 1
+        else:
+            built += 1
+
+    return built, from_cache
+
+
+def summarize_atomic_notes_multi(
+    root: TreeNode,
+    chat_fn: ChatFn,
+    *,
+    vault_roots: list[Path],
+    model_id: str,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    skip_existing: bool = True,
+    summary_caches: dict[Path, SummaryCache] | None = None,
+) -> int:
+    """Multi-vault aware summarize_atomic_notes (v0.11).
+
+    Routes each note's summary cache lookup/write to its owning
+    vault's ``SummaryCache`` instance.
+    """
+    if summary_caches is None:
+        summary_caches = {}
+    for v in vault_roots:
+        if v not in summary_caches:
+            summary_caches[v] = SummaryCache(v)
+
+    primary = vault_roots[0]
+
+    # Phase 1: cache hits first, remaining notes deferred.
+    pending: list[tuple[TreeNode, SummaryCache]] = []
+    for node in root.walk():
+        if node.kind != "note" or node.tier != NoteTier.ATOMIC:
+            continue
+        if skip_existing and node.summary:
+            continue
+        if node.file_path is None:
+            continue
+
+        owning_vault = vault_for_note(node.file_path, vault_roots) or primary
+        cache = summary_caches[owning_vault]
+
+        cached = cache.load(node.file_path, model_id)
+        if cached is not None:
+            node.summary = cached
+            continue
+
+        pending.append((node, cache))
+
+    if not pending:
+        return 0
+
+    def _summarize_one(
+        item: tuple[TreeNode, SummaryCache],
+    ) -> tuple[TreeNode, SummaryCache, str]:
+        node, cache = item
+        assert node.file_path is not None
+        content = node.file_path.read_text(encoding="utf-8")
+        prompt = atomic_summary_prompt(node.title, content)
+        summary = chat_fn(prompt).strip().strip("\"'").strip()
+        return node, cache, summary
+
+    if max_workers <= 1 or len(pending) == 1:
+        results = [_summarize_one(item) for item in pending]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(_summarize_one, pending))
+
+    for node, cache, summary in results:
+        node.summary = summary
+        if node.file_path is not None:
+            cache.save(node.file_path, model_id, summary)
+
+    return len(results)
+
+
 def filter_tree(
     root: TreeNode,
     *,

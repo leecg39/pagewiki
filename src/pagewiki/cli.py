@@ -24,10 +24,12 @@ from .retrieval import run_retrieval
 from .tree import NoteTier
 from .vault import (
     build_long_subtrees,
+    build_long_subtrees_multi,
     filter_tree,
     scan_folder,
     scan_multi_vault,
     summarize_atomic_notes,
+    summarize_atomic_notes_multi,
 )
 
 console = Console()
@@ -461,12 +463,26 @@ def vaults() -> None:
     "--max-workers", default=4, type=int,
     help="Parallel LLM workers for entity extraction + page generation.",
 )
+@click.option(
+    "--usage",
+    is_flag=True,
+    help="Print token usage breakdown at the end of compilation (v0.11).",
+)
+@click.option(
+    "--usage-db",
+    "usage_db",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Persist usage events to a SQLite database (v0.11).",
+)
 def compile(
     vault: Path | None,
     folder: str | None,
     model: str,
     num_ctx: int,
     max_workers: int,
+    usage: bool,
+    usage_db: Path | None,
 ) -> None:
     """Compile vault notes into an LLM-Wiki (entity pages + index).
 
@@ -492,7 +508,18 @@ def compile(
         f"[dim]Found {note_count} notes to process (parallel: {max_workers})...[/]"
     )
 
-    chat_fn = _make_chat_fn(model, num_ctx)
+    # v0.11: optional usage tracking + persistence for compile.
+    from .usage import UsageTracker
+
+    tracker = UsageTracker() if (usage or usage_db is not None) else None
+    store = None
+    if usage_db is not None:
+        from .usage_store import UsageStore
+
+        store = UsageStore(usage_db)
+        console.print(f"[dim]Usage persistence: {usage_db}[/]")
+
+    chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker, usage_store=store)
     wiki_dir = compile_wiki(
         root, vault, chat_fn, subfolder=folder, max_workers=max_workers,
     )
@@ -504,6 +531,31 @@ def compile(
         f"{len(generated)} pages written to {wiki_dir}"
     )
     console.print("[dim]Open in Obsidian: index.md is the entry point.[/]")
+
+    if tracker is not None and tracker.total_calls > 0:
+        usage_table = Table(title="Compile Token Usage (v0.11)")
+        usage_table.add_column("Phase", style="bold")
+        usage_table.add_column("Calls", justify="right")
+        usage_table.add_column("Prompt", justify="right")
+        usage_table.add_column("Completion", justify="right")
+        usage_table.add_column("Elapsed (s)", justify="right")
+        for phase, bucket in sorted(tracker.by_phase().items()):
+            usage_table.add_row(
+                phase,
+                str(int(bucket["calls"])),
+                f"{int(bucket['prompt']):,}",
+                f"{int(bucket['completion']):,}",
+                f"{bucket['elapsed']:.1f}",
+            )
+        usage_table.add_row(
+            "[bold]TOTAL",
+            str(tracker.total_calls),
+            f"[bold]{tracker.total_prompt_tokens:,}",
+            f"[bold]{tracker.total_completion_tokens:,}",
+            f"[bold]{tracker.total_elapsed:.1f}",
+        )
+        console.print()
+        console.print(usage_table)
 
 
 @main.command()
@@ -779,16 +831,25 @@ def ask(
         console.print(f"[red]No notes found in {vault / folder}[/]")
         sys.exit(1)
 
-    # Step 2: summarize atomic notes (optional, cached, parallel in v0.7)
+    # Step 2: summarize atomic notes (optional, cached, parallel in v0.7,
+    # per-vault cache routing in v0.11).
     if not skip_summaries:
         console.print(
             f"[dim]2/4 Summarizing atomic notes (parallel: {max_workers} workers)...[/]"
         )
-        scache = SummaryCache(vault)
-        summarized = summarize_atomic_notes(
-            root, chat_fn, summary_cache=scache, model_id=model,
-            max_workers=max_workers,
-        )
+        if multi_vault:
+            summarized = summarize_atomic_notes_multi(
+                root, chat_fn,
+                vault_roots=all_vaults,
+                model_id=model,
+                max_workers=max_workers,
+            )
+        else:
+            scache = SummaryCache(vault)
+            summarized = summarize_atomic_notes(
+                root, chat_fn, summary_cache=scache, model_id=model,
+                max_workers=max_workers,
+            )
         console.print(f"[dim]    → {summarized} notes summarized (rest from cache)[/]")
     else:
         console.print("[dim]2/4 Skipping summarization (--skip-summaries)[/]")
@@ -799,13 +860,21 @@ def ask(
             f"[dim]3/4 Building PageIndex sub-trees for {long_count} LONG notes...[/]"
         )
         section_chat_fn = None if skip_summaries else chat_fn
-        built, from_cache = build_long_subtrees(
-            root,
-            vault_root=vault,
-            model_id=model,
-            chat_fn=section_chat_fn,
-            cache=TreeCache(vault),
-        )
+        if multi_vault:
+            built, from_cache = build_long_subtrees_multi(
+                root,
+                vault_roots=all_vaults,
+                model_id=model,
+                chat_fn=section_chat_fn,
+            )
+        else:
+            built, from_cache = build_long_subtrees(
+                root,
+                vault_root=vault,
+                model_id=model,
+                chat_fn=section_chat_fn,
+                cache=TreeCache(vault),
+            )
         console.print(f"[dim]    → {built} built, {from_cache} from cache[/]")
     else:
         console.print("[dim]3/4 No LONG notes — skipping sub-tree build[/]")
@@ -1319,6 +1388,132 @@ def serve(
 
     app = create_app(state)
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+@main.command("usage-report")
+@click.option(
+    "--db",
+    "db_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to the SQLite usage database (written by `serve --usage-db`).",
+)
+@click.option(
+    "--since",
+    default=None,
+    help="Only include events newer than this ISO date (e.g. 2024-11-01).",
+)
+@click.option(
+    "--until",
+    default=None,
+    help="Only include events older than this ISO date.",
+)
+@click.option(
+    "--phase",
+    default=None,
+    help="Filter to a single phase (select/evaluate/final/...).",
+)
+@click.option(
+    "--recent",
+    default=0,
+    type=int,
+    help="Also print the N most recent events as a detail list.",
+)
+def usage_report(
+    db_path: Path,
+    since: str | None,
+    until: str | None,
+    phase: str | None,
+    recent: int,
+) -> None:
+    """Query a SQLite usage database and print a Rich breakdown (v0.11).
+
+    Pair with ``pagewiki serve --usage-db PATH`` which persists every
+    LLM call into the same database. Useful for daily/weekly token
+    cost audits, cost attribution by phase, and trend analysis
+    across many sessions.
+    """
+    from datetime import datetime
+
+    from .usage_store import UsageStore
+
+    def _parse_iso(s: str | None) -> float | None:
+        if s is None:
+            return None
+        # Accept bare dates or full ISO timestamps.
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            console.print(f"[red]Invalid ISO timestamp: {s}[/]")
+            sys.exit(1)
+        return dt.timestamp()
+
+    since_ts = _parse_iso(since)
+    until_ts = _parse_iso(until)
+
+    store = UsageStore(db_path)
+    summary = store.query_summary(since=since_ts, until=until_ts)
+
+    title_parts = [f"Usage Report ({db_path.name})"]
+    if since:
+        title_parts.append(f"since={since}")
+    if until:
+        title_parts.append(f"until={until}")
+    if phase:
+        title_parts.append(f"phase={phase}")
+
+    console.print(f"[bold cyan]{' | '.join(title_parts)}[/]")
+    console.print(
+        f"[dim]total_calls={summary.total_calls:,}  "
+        f"prompt={summary.total_prompt:,}  "
+        f"completion={summary.total_completion:,}  "
+        f"elapsed={summary.total_elapsed:.1f}s[/]\n"
+    )
+
+    if summary.total_calls == 0:
+        console.print("[yellow]No events match the filter.[/]")
+        return
+
+    by_phase_items = summary.by_phase.items()
+    if phase:
+        by_phase_items = [(p, b) for p, b in by_phase_items if p == phase]
+
+    table = Table(title="By Phase")
+    table.add_column("Phase", style="bold")
+    table.add_column("Calls", justify="right")
+    table.add_column("Prompt", justify="right")
+    table.add_column("Completion", justify="right")
+    table.add_column("Elapsed (s)", justify="right")
+    for p, b in sorted(by_phase_items):
+        table.add_row(
+            p,
+            f"{int(b['calls']):,}",
+            f"{int(b['prompt']):,}",
+            f"{int(b['completion']):,}",
+            f"{float(b['elapsed']):.1f}",
+        )
+    console.print(table)
+
+    if recent > 0:
+        events = store.query_events(
+            since=since_ts,
+            until=until_ts,
+            phase=phase,
+            limit=recent,
+        )
+        if events:
+            console.print(f"\n[bold]Most recent {len(events)} events:[/]")
+            for e in events:
+                ts = datetime.fromtimestamp(e.timestamp).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                console.print(
+                    f"  [dim]{ts}[/] [cyan]{e.phase:<10}[/] "
+                    f"p={e.prompt:,} c={e.completion:,} "
+                    f"({e.elapsed:.1f}s)"
+                )
+
+    store.close()
 
 
 if __name__ == "__main__":
