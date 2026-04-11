@@ -178,7 +178,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
     clear install hint if either is missing.
     """
     try:
-        from fastapi import Body, FastAPI, HTTPException
+        from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
         from fastapi.responses import StreamingResponse
         from pydantic import BaseModel, Field
     except ImportError as e:
@@ -188,7 +188,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.11.0")
+    app = FastAPI(title="pagewiki API", version="0.12.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -289,7 +289,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.11.0",
+            "version": "0.12.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -593,6 +593,198 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             session=session,
             include_session=True,
         )
+
+    # ── v0.12 WebSocket endpoint with interrupt support ───────────────────
+
+    @app.websocket("/ask/ws")
+    async def ask_ws(websocket: WebSocket) -> None:
+        """Bidirectional WebSocket channel for retrieval with cancellation.
+
+        Protocol:
+
+          Client → Server messages::
+
+            {"type": "ask", "query": "...", "decompose": false}
+            {"type": "cancel"}
+            {"type": "ping"}
+
+          Server → Client messages::
+
+            {"type": "trace",  "phase": "...", "node_id": "...", "detail": "..."}
+            {"type": "usage",  "total_calls": N, "prompt_tokens": ..., ...}
+            {"type": "answer", "answer": "...", "cited_nodes": [...], "iterations_used": N}
+            {"type": "cancelled"}
+            {"type": "error",  "message": "..."}
+            {"type": "pong"}
+
+        One retrieval runs per connection at a time. Sending
+        ``{"type": "ask", ...}`` while a query is in flight queues
+        the new request after the current one finishes.
+        """
+        import asyncio as _asyncio
+        import json as _json
+        import queue as _queue
+        import threading as _threading
+
+        await websocket.accept()
+
+        stop_event = _threading.Event()
+        event_queue: _queue.Queue[tuple[str, dict] | None] = _queue.Queue()
+
+        local_tracker = UsageTracker()
+        import time as _time
+
+        def tracked_chat_fn(prompt: str) -> str:
+            t0 = _time.time()
+            text = state.chat_fn(prompt)
+            elapsed = _time.time() - t0
+            local_tracker.record(
+                "other",
+                max(1, len(prompt) // 3),
+                max(1, len(text) // 3),
+                elapsed,
+            )
+            return text
+
+        def on_event(step: TraceStep) -> None:
+            event_queue.put(
+                (
+                    "trace",
+                    {
+                        "phase": step.phase,
+                        "node_id": step.node_id,
+                        "detail": step.detail,
+                    },
+                )
+            )
+            event_queue.put(
+                (
+                    "usage",
+                    {
+                        "total_calls": local_tracker.total_calls,
+                        "prompt_tokens": local_tracker.total_prompt_tokens,
+                        "completion_tokens": local_tracker.total_completion_tokens,
+                        "total_tokens": local_tracker.total_tokens,
+                        "elapsed": local_tracker.total_elapsed,
+                    },
+                )
+            )
+
+        def run_query(query: str, decompose: bool) -> None:
+            try:
+                if decompose:
+                    result = run_decomposed_retrieval(
+                        query, state.root, tracked_chat_fn,
+                        link_index=state.link_index,
+                        on_event=on_event,
+                    )
+                else:
+                    result = run_retrieval(
+                        query, state.root, tracked_chat_fn,
+                        link_index=state.link_index,
+                        on_event=on_event,
+                        should_stop=stop_event.is_set,
+                    )
+                if stop_event.is_set():
+                    event_queue.put(("cancelled", {}))
+                else:
+                    event_queue.put(
+                        (
+                            "answer",
+                            {
+                                "answer": result.answer,
+                                "cited_nodes": result.cited_nodes,
+                                "iterations_used": result.iterations_used,
+                            },
+                        )
+                    )
+            except Exception as exc:  # pragma: no cover
+                event_queue.put(("error", {"message": str(exc)}))
+            finally:
+                event_queue.put(None)  # sentinel
+
+        current_worker: _threading.Thread | None = None
+
+        async def drain_queue() -> None:
+            """Pull events from the sync queue and push them to the socket."""
+            while True:
+                item = await _asyncio.to_thread(event_queue.get)
+                if item is None:
+                    return
+                event_name, data = item
+                await websocket.send_text(
+                    _json.dumps({"type": event_name, **data}, ensure_ascii=False)
+                )
+
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    msg = _json.loads(raw)
+                except _json.JSONDecodeError:
+                    await websocket.send_text(
+                        _json.dumps({"type": "error", "message": "invalid JSON"})
+                    )
+                    continue
+
+                msg_type = msg.get("type")
+
+                if msg_type == "ping":
+                    await websocket.send_text(_json.dumps({"type": "pong"}))
+                    continue
+
+                if msg_type == "cancel":
+                    stop_event.set()
+                    continue
+
+                if msg_type == "ask":
+                    if current_worker is not None and current_worker.is_alive():
+                        await websocket.send_text(
+                            _json.dumps(
+                                {
+                                    "type": "error",
+                                    "message": "a query is already in flight",
+                                }
+                            )
+                        )
+                        continue
+
+                    query = msg.get("query", "")
+                    if not query:
+                        await websocket.send_text(
+                            _json.dumps(
+                                {"type": "error", "message": "empty query"}
+                            )
+                        )
+                        continue
+
+                    # Reset per-query state.
+                    stop_event.clear()
+                    while not event_queue.empty():
+                        try:
+                            event_queue.get_nowait()
+                        except _queue.Empty:
+                            break
+
+                    current_worker = _threading.Thread(
+                        target=run_query,
+                        args=(query, bool(msg.get("decompose", False))),
+                        daemon=True,
+                    )
+                    current_worker.start()
+                    # Drain until this query finishes (sentinel).
+                    await drain_queue()
+                    continue
+
+                await websocket.send_text(
+                    _json.dumps(
+                        {"type": "error", "message": f"unknown type: {msg_type}"}
+                    )
+                )
+        except WebSocketDisconnect:
+            # Client vanished — best-effort signal to the worker.
+            stop_event.set()
+            return
 
     return app
 

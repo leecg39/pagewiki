@@ -39,15 +39,17 @@ Design notes
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_events (
@@ -62,6 +64,18 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp
     ON usage_events (timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_events_phase
     ON usage_events (phase);
+
+-- v0.12 daily rollup table for fast historical queries.
+-- One row per local-date; phase_breakdown holds a JSON object
+-- keyed by phase → {calls, prompt, completion, elapsed}.
+CREATE TABLE IF NOT EXISTS usage_daily (
+    date              TEXT    PRIMARY KEY,  -- YYYY-MM-DD
+    total_calls       INTEGER NOT NULL,
+    total_prompt      INTEGER NOT NULL,
+    total_completion  INTEGER NOT NULL,
+    total_elapsed     REAL    NOT NULL,
+    phase_breakdown   TEXT    NOT NULL
+);
 """
 
 
@@ -235,10 +249,167 @@ class UsageStore:
         )
 
     def clear(self) -> int:
-        """Drop every row. Returns the count deleted."""
+        """Drop every row (both events and daily rollups). Returns event count."""
         with self._lock:
             cursor = self._conn.execute("DELETE FROM usage_events")
+            self._conn.execute("DELETE FROM usage_daily")
             return cursor.rowcount
+
+    # ── v0.12 daily rollups ────────────────────────────────────────────────
+
+    def rollup_day(self, day: str) -> int:
+        """Aggregate events for ``day`` (YYYY-MM-DD) into the daily table.
+
+        Overwrites any existing row for that day. Returns the row count
+        written (always 0 or 1). Meant to be called once the day is
+        "complete" — running against the current day is fine but the
+        row will be stale until the next invocation.
+        """
+        # Convert the local date to a unix-epoch range.
+        try:
+            d = date.fromisoformat(day)
+        except ValueError as e:
+            raise ValueError(f"Invalid date (use YYYY-MM-DD): {day}") from e
+        start_ts = datetime(d.year, d.month, d.day).timestamp()
+        end_ts = start_ts + 86400.0
+
+        with self._lock:
+            totals = self._conn.execute(
+                "SELECT COUNT(*), "
+                "       COALESCE(SUM(prompt), 0), "
+                "       COALESCE(SUM(completion), 0), "
+                "       COALESCE(SUM(elapsed), 0.0) "
+                "FROM usage_events "
+                "WHERE timestamp >= ? AND timestamp < ?",
+                (start_ts, end_ts),
+            ).fetchone()
+
+            total_calls = totals[0]
+            if total_calls == 0:
+                # Still write a zero row so repeated queries are cheap,
+                # but only if we don't already have one.
+                existing = self._conn.execute(
+                    "SELECT 1 FROM usage_daily WHERE date = ?", (day,)
+                ).fetchone()
+                if existing:
+                    return 0
+
+            by_phase_rows = self._conn.execute(
+                "SELECT phase, "
+                "       COUNT(*), "
+                "       COALESCE(SUM(prompt), 0), "
+                "       COALESCE(SUM(completion), 0), "
+                "       COALESCE(SUM(elapsed), 0.0) "
+                "FROM usage_events "
+                "WHERE timestamp >= ? AND timestamp < ? "
+                "GROUP BY phase",
+                (start_ts, end_ts),
+            ).fetchall()
+
+            phase_json = json.dumps(
+                {
+                    row[0]: {
+                        "calls": row[1],
+                        "prompt": row[2],
+                        "completion": row[3],
+                        "elapsed": row[4],
+                    }
+                    for row in by_phase_rows
+                },
+                ensure_ascii=False,
+            )
+
+            self._conn.execute(
+                "INSERT OR REPLACE INTO usage_daily "
+                "(date, total_calls, total_prompt, total_completion, "
+                " total_elapsed, phase_breakdown) VALUES (?, ?, ?, ?, ?, ?)",
+                (day, total_calls, totals[1], totals[2], totals[3], phase_json),
+            )
+        return 1
+
+    def rollup_range(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> int:
+        """Rollup every day between ``since`` and ``until`` inclusive.
+
+        If ``since`` is omitted, rolls up from the earliest event in the
+        store. If ``until`` is omitted, rolls up through yesterday (so
+        the current in-progress day stays an event-only query).
+        Returns the number of days written.
+        """
+        if since is None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT MIN(timestamp) FROM usage_events"
+                ).fetchone()
+            if row is None or row[0] is None:
+                return 0
+            since_date = datetime.fromtimestamp(row[0]).date()
+        else:
+            since_date = date.fromisoformat(since)
+
+        if until is None:
+            until_date = date.today() - timedelta(days=1)
+        else:
+            until_date = date.fromisoformat(until)
+
+        if until_date < since_date:
+            return 0
+
+        written = 0
+        day = since_date
+        while day <= until_date:
+            written += self.rollup_day(day.isoformat())
+            day += timedelta(days=1)
+        return written
+
+    def query_daily(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[dict]:
+        """Return daily rollup rows as dicts ordered by date ascending.
+
+        Callers should invoke ``rollup_range`` first to ensure the
+        rollup table reflects recent events.
+        """
+        sql = (
+            "SELECT date, total_calls, total_prompt, total_completion, "
+            "total_elapsed, phase_breakdown FROM usage_daily WHERE 1=1"
+        )
+        params: list[object] = []
+        if since is not None:
+            sql += " AND date >= ?"
+            params.append(since)
+        if until is not None:
+            sql += " AND date <= ?"
+            params.append(until)
+        sql += " ORDER BY date ASC"
+
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+
+        out: list[dict] = []
+        for r in rows:
+            try:
+                phase = json.loads(r[5]) if r[5] else {}
+            except json.JSONDecodeError:
+                phase = {}
+            out.append(
+                {
+                    "date": r[0],
+                    "total_calls": r[1],
+                    "total_prompt": r[2],
+                    "total_completion": r[3],
+                    "total_elapsed": r[4],
+                    "by_phase": phase,
+                }
+            )
+        return out
 
     def close(self) -> None:
         with self._lock:

@@ -1,19 +1,21 @@
 /**
- * PageWiki Obsidian Plugin (v0.11)
+ * PageWiki Obsidian Plugin (v0.12)
  *
  * Wraps the pagewiki CLI so users can scan, ask, chat, compile, and watch
  * from within Obsidian — no terminal switching required.
  *
- * Commands are executed via Node child_process.exec against the
- * `pagewiki` CLI that the user has already pip-installed. Results
- * are displayed in Obsidian modals with Rich-markup stripped.
+ * v0.12 adds an optional "server mode" where Ask/Chat talk directly
+ * to a running `pagewiki serve` instance via POST /ask/stream or
+ * POST /chat/stream, avoiding the child_process subprocess overhead
+ * and showing live SSE trace events as they arrive.
  *
  * Version history:
  *   - v0.7: maxWorkers + decomposeByDefault
  *   - v0.8: N/A (plugin-side)
  *   - v0.9: --usage, --max-tokens flags
  *   - v0.10: --json-mode, --reuse-context flags
- *   - v0.11: Chat streaming (when pagewiki serve is reachable)
+ *   - v0.11: Chat modal full flag surface
+ *   - v0.12: Server mode (SSE streaming from pagewiki serve)
  */
 
 import {
@@ -44,6 +46,9 @@ interface PageWikiSettings {
 	// v0.10
 	jsonMode: boolean;
 	reuseContext: boolean;
+	// v0.12 — when set, Ask/Chat stream via SSE from this server
+	// instead of spawning `python -m pagewiki` as a subprocess.
+	serverUrl: string;
 }
 
 const DEFAULT_SETTINGS: PageWikiSettings = {
@@ -57,6 +62,7 @@ const DEFAULT_SETTINGS: PageWikiSettings = {
 	maxTokens: 0,
 	jsonMode: false,
 	reuseContext: false,
+	serverUrl: "",
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +73,88 @@ const DEFAULT_SETTINGS: PageWikiSettings = {
 function stripAnsi(text: string): string {
 	// eslint-disable-next-line no-control-regex
 	return text.replace(/\x1b\[[0-9;]*m/g, "").replace(/\[\/?\w+\]/g, "");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Server mode SSE client (v0.12)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface SSEEvent {
+	event: string;
+	data: any;
+}
+
+/**
+ * POST JSON to an SSE endpoint and invoke ``onEvent`` for each parsed frame.
+ *
+ * Uses the standard ``text/event-stream`` format:
+ *   event: <name>\n
+ *   data: <json>\n\n
+ *
+ * Returns when the stream closes (either naturally or on error).
+ * The caller can abort mid-stream by passing an AbortSignal in
+ * ``opts.signal``.
+ */
+async function streamSSE(
+	url: string,
+	body: object,
+	onEvent: (ev: SSEEvent) => void,
+	opts: { signal?: AbortSignal } = {},
+): Promise<void> {
+	const response = await fetch(url, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"Accept": "text/event-stream",
+		},
+		body: JSON.stringify(body),
+		signal: opts.signal,
+	});
+	if (!response.ok) {
+		throw new Error(`SSE endpoint returned ${response.status}`);
+	}
+	if (!response.body) {
+		throw new Error("SSE response has no body stream");
+	}
+
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let buf = "";
+
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			buf += decoder.decode(value, { stream: true });
+
+			// Split on double newline — each SSE frame ends with "\n\n".
+			let idx: number;
+			while ((idx = buf.indexOf("\n\n")) !== -1) {
+				const frame = buf.slice(0, idx);
+				buf = buf.slice(idx + 2);
+				if (!frame.trim()) continue;
+
+				let eventName = "message";
+				let dataStr = "";
+				for (const line of frame.split("\n")) {
+					if (line.startsWith("event: ")) {
+						eventName = line.slice(7).trim();
+					} else if (line.startsWith("data: ")) {
+						dataStr += line.slice(6);
+					}
+				}
+				if (dataStr) {
+					try {
+						onEvent({ event: eventName, data: JSON.parse(dataStr) });
+					} catch {
+						onEvent({ event: eventName, data: dataStr });
+					}
+				}
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
 }
 
 /** Run a pagewiki CLI command and return stdout. */
@@ -242,6 +330,8 @@ class ChatModal extends Modal {
 	private inputEl!: HTMLTextAreaElement;
 	private submitBtn!: HTMLButtonElement;
 	private busy = false;
+	// v0.12 server-mode session state.
+	private serverSessionId: string | null = null;
 
 	constructor(app: App, settings: PageWikiSettings) {
 		super(app);
@@ -365,34 +455,12 @@ class ChatModal extends Modal {
 		this.submitBtn.disabled = true;
 
 		try {
-			const contextQuery = this._buildContextQuery(query);
-			const escaped = contextQuery.replace(/"/g, '\\"');
-			let args =
-				`ask "${escaped}" --folder "${this.settings.folder}" ` +
-				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx} ` +
-				`--max-workers ${this.settings.maxWorkers}`;
-			if (this.settings.decomposeByDefault) {
-				args += " --decompose";
+			// v0.12 server mode — stream from /chat/stream if configured.
+			if (this.settings.serverUrl.trim()) {
+				await this._submitServerMode(query);
+			} else {
+				await this._submitCliMode(query);
 			}
-			// v0.9+ flags propagated from settings.
-			if (this.settings.showUsage) {
-				args += " --usage";
-			}
-			if (this.settings.maxTokens > 0) {
-				args += ` --max-tokens ${this.settings.maxTokens}`;
-			}
-			// v0.10+ flags.
-			if (this.settings.jsonMode) {
-				args += " --json-mode";
-			}
-			if (this.settings.reuseContext) {
-				args += " --reuse-context";
-			}
-			const output = await runPagewiki(this.app, this.settings, args);
-
-			// Extract the answer line from CLI output (after "A: ")
-			const answer = this._extractAnswer(output);
-			this._appendMessage({ role: "assistant", text: answer });
 		} catch (e: any) {
 			this._appendSystemMessage(`Error: ${e.message}`);
 		} finally {
@@ -401,6 +469,86 @@ class ChatModal extends Modal {
 			this.submitBtn.disabled = false;
 			this.inputEl.focus();
 		}
+	}
+
+	private async _submitCliMode(query: string): Promise<void> {
+		const contextQuery = this._buildContextQuery(query);
+		const escaped = contextQuery.replace(/"/g, '\\"');
+		let args =
+			`ask "${escaped}" --folder "${this.settings.folder}" ` +
+			`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx} ` +
+			`--max-workers ${this.settings.maxWorkers}`;
+		if (this.settings.decomposeByDefault) {
+			args += " --decompose";
+		}
+		if (this.settings.showUsage) {
+			args += " --usage";
+		}
+		if (this.settings.maxTokens > 0) {
+			args += ` --max-tokens ${this.settings.maxTokens}`;
+		}
+		if (this.settings.jsonMode) {
+			args += " --json-mode";
+		}
+		if (this.settings.reuseContext) {
+			args += " --reuse-context";
+		}
+		const output = await runPagewiki(this.app, this.settings, args);
+		const answer = this._extractAnswer(output);
+		this._appendMessage({ role: "assistant", text: answer });
+	}
+
+	private async _submitServerMode(query: string): Promise<void> {
+		const base = this.settings.serverUrl.trim().replace(/\/$/, "");
+		const url = `${base}/chat/stream`;
+
+		let answer = "";
+		const cited: string[] = [];
+
+		// Placeholder assistant bubble we mutate in-place as tokens stream.
+		const placeholder = { role: "assistant" as const, text: "…" };
+		this._appendMessage(placeholder);
+		// Reference to the just-appended body span for live updates.
+		const bodySpan = this.messagesEl.lastElementChild?.querySelector(
+			"span",
+		) as HTMLSpanElement | null;
+
+		await streamSSE(
+			url,
+			{
+				query,
+				session_id: this.serverSessionId,
+				decompose: this.settings.decomposeByDefault,
+			},
+			(ev) => {
+				if (ev.event === "trace" && bodySpan) {
+					bodySpan.setText(
+						`[${ev.data.phase}] ${ev.data.detail?.substring(0, 80) ?? ""}`,
+					);
+				} else if (ev.event === "answer") {
+					answer = ev.data.answer || "";
+					if (Array.isArray(ev.data.cited_nodes)) {
+						cited.push(...ev.data.cited_nodes);
+					}
+					if (typeof ev.data.session_id === "string") {
+						this.serverSessionId = ev.data.session_id;
+					}
+				} else if (ev.event === "error") {
+					throw new Error(ev.data.message || "server error");
+				}
+			},
+		);
+
+		if (bodySpan) {
+			bodySpan.setText(
+				answer +
+					(cited.length > 0
+						? `\n\nCited:\n${cited.map((c) => `  • ${c}`).join("\n")}`
+						: ""),
+			);
+		}
+		// Keep local history in sync (for buildContextQuery fallback).
+		placeholder.text = answer;
 	}
 
 	/** Parse the answer from pagewiki ask CLI output. */
@@ -621,6 +769,26 @@ class PageWikiSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}),
 			);
+
+		// ── v0.12 server mode ──────────────────────────────────────────
+		containerEl.createEl("h3", { text: "v0.12 Server Mode (optional)" });
+
+		new Setting(containerEl)
+			.setName("Server URL")
+			.setDesc(
+				"When set, Ask/Chat stream SSE from this `pagewiki serve` " +
+				"URL instead of spawning a Python subprocess. " +
+				"Example: http://localhost:8000 (v0.12). Leave blank for CLI mode.",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("http://localhost:8000")
+					.setValue(this.plugin.settings.serverUrl)
+					.onChange(async (value) => {
+						this.plugin.settings.serverUrl = value;
+						await this.plugin.saveSettings();
+					}),
+			);
 	}
 }
 
@@ -737,10 +905,17 @@ export default class PageWikiPlugin extends Plugin {
 	}
 
 	private async runAsk(query: string, decompose?: boolean): Promise<void> {
+		const useDecompose = decompose ?? this.settings.decomposeByDefault;
+
+		// v0.12 server mode — SSE stream from a running `pagewiki serve`.
+		if (this.settings.serverUrl.trim()) {
+			await this._runAskServerMode(query, useDecompose);
+			return;
+		}
+
 		const notice = new Notice("PageWiki: Thinking...", 0);
 		try {
 			const escaped = query.replace(/"/g, '\\"');
-			const useDecompose = decompose ?? this.settings.decomposeByDefault;
 			let args =
 				`ask "${escaped}" --folder "${this.settings.folder}" ` +
 				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx} ` +
@@ -769,6 +944,60 @@ export default class PageWikiPlugin extends Plugin {
 			notice.hide();
 			new Notice(`PageWiki ask failed: ${e.message}`, 10000);
 		}
+	}
+
+	/** v0.12 server-mode: stream /ask/stream and render the final answer. */
+	private async _runAskServerMode(
+		query: string,
+		decompose: boolean,
+	): Promise<void> {
+		const base = this.settings.serverUrl.trim().replace(/\/$/, "");
+		const url = `${base}/ask/stream`;
+
+		const notice = new Notice("PageWiki: Streaming answer...", 0);
+		let answer = "";
+		const cited: string[] = [];
+		let traceCount = 0;
+		let tokenTotal = 0;
+
+		try {
+			await streamSSE(
+				url,
+				{
+					query,
+					decompose,
+				},
+				(ev) => {
+					if (ev.event === "trace") {
+						traceCount++;
+						// Update the notice so users see progress.
+						notice.setMessage(
+							`PageWiki: ${traceCount} steps, ${tokenTotal} tokens`,
+						);
+					} else if (ev.event === "usage") {
+						tokenTotal = ev.data.total_tokens || 0;
+					} else if (ev.event === "answer") {
+						answer = ev.data.answer || "";
+						if (Array.isArray(ev.data.cited_nodes)) {
+							cited.push(...ev.data.cited_nodes);
+						}
+					} else if (ev.event === "error") {
+						throw new Error(ev.data.message || "server error");
+					}
+				},
+			);
+		} catch (e: any) {
+			notice.hide();
+			new Notice(`PageWiki server error: ${e.message}`, 10000);
+			return;
+		}
+
+		notice.hide();
+		const body =
+			`A: ${answer}\n\n` +
+			(cited.length > 0 ? `Cited:\n${cited.map((c) => `  • ${c}`).join("\n")}\n\n` : "") +
+			`[server mode: ${traceCount} trace events, ${tokenTotal} tokens]`;
+		new ResultModal(this.app, "Answer (server mode)", body).open();
 	}
 
 	private async runCompile(): Promise<void> {

@@ -747,6 +747,12 @@ def watch(
     is_flag=True,
     help="Compact path_so_far + suppress already-shown candidates (v0.10).",
 )
+@click.option(
+    "--per-vault",
+    "per_vault",
+    is_flag=True,
+    help="Run retrieval independently per vault then synthesize (v0.12).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -765,6 +771,7 @@ def ask(
     max_tokens: int | None,
     json_mode: bool,
     reuse_context: bool,
+    per_vault: bool,
 ) -> None:
     """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
@@ -890,7 +897,7 @@ def ask(
     else:
         console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
 
-    from .retrieval import TraceStep, run_decomposed_retrieval
+    from .retrieval import TraceStep, run_cross_vault_retrieval, run_decomposed_retrieval
 
     _phase_icons = {
         "select": "[cyan]SELECT[/]",
@@ -900,6 +907,8 @@ def ask(
         "decompose": "[blue]DECOMP[/]",
         "reuse": "[dim]REUSE[/]",
         "budget": "[red]BUDGET[/]",
+        "cross-vault": "[bold blue]VAULT[/]",
+        "cancel": "[red]CANCEL[/]",
     }
 
     def _on_event(step: TraceStep) -> None:
@@ -907,7 +916,54 @@ def ask(
         node_part = f" [{escape(step.node_id)}]" if step.node_id else ""
         console.print(f"  {icon}{node_part} {escape(step.detail)}")
 
-    if decompose:
+    if per_vault and multi_vault:
+        # v0.12: rescan each vault into an isolated root so run_cross_vault_retrieval
+        # can attribute results per vault. Re-uses the caches already warmed above.
+        console.print(
+            f"[dim]4/4 Running per-vault retrieval "
+            f"across {len(all_vaults)} vaults...[/]\n"
+        )
+        per_vault_roots = []
+        per_vault_labels = []
+        per_vault_indexes = []
+        for v in all_vaults:
+            v_root = scan_folder(v, folder)
+            if active_filters or filter_after or filter_before:
+                v_root = filter_tree(
+                    v_root, tags=active_filters,
+                    after=filter_after, before=filter_before,
+                )
+            # Reuse summary cache since we already warmed it.
+            if not skip_summaries:
+                summarize_atomic_notes(
+                    v_root, chat_fn,
+                    summary_cache=SummaryCache(v),
+                    model_id=model,
+                    max_workers=max_workers,
+                )
+            v_long = sum(
+                1 for n in v_root.walk()
+                if n.kind == "note" and n.tier == NoteTier.LONG
+            )
+            if v_long > 0:
+                build_long_subtrees(
+                    v_root, vault_root=v, model_id=model,
+                    chat_fn=(None if skip_summaries else chat_fn),
+                    cache=TreeCache(v),
+                )
+            per_vault_roots.append(v_root)
+            per_vault_labels.append(v.name)
+            per_vault_indexes.append(build_link_index(v_root))
+
+        result = run_cross_vault_retrieval(
+            query, per_vault_roots, chat_fn,
+            link_indexes=per_vault_indexes,
+            vault_labels=per_vault_labels,
+            on_event=_on_event,
+            max_tokens=max_tokens, tracker=tracker,
+            json_mode=json_mode, reuse_context=reuse_context,
+        )
+    elif decompose:
         result = run_decomposed_retrieval(
             query, root, chat_fn,
             link_index=link_index, on_event=_on_event,
@@ -1419,12 +1475,18 @@ def serve(
     type=int,
     help="Also print the N most recent events as a detail list.",
 )
+@click.option(
+    "--daily",
+    is_flag=True,
+    help="Rollup and print daily aggregates (v0.12).",
+)
 def usage_report(
     db_path: Path,
     since: str | None,
     until: str | None,
     phase: str | None,
     recent: int,
+    daily: bool,
 ) -> None:
     """Query a SQLite usage database and print a Rich breakdown (v0.11).
 
@@ -1512,6 +1574,34 @@ def usage_report(
                     f"p={e.prompt:,} c={e.completion:,} "
                     f"({e.elapsed:.1f}s)"
                 )
+
+    if daily:
+        # Rollup any missing days and then query the table for display.
+        # ``since``/``until`` here are ISO date strings (rollup_range
+        # uses date.fromisoformat) rather than datetime timestamps.
+        written = store.rollup_range(since=since, until=until)
+        rows = store.query_daily(since=since, until=until)
+        if rows:
+            daily_table = Table(
+                title=f"Daily Rollup (rolled {written} new days)"
+            )
+            daily_table.add_column("Date", style="bold")
+            daily_table.add_column("Calls", justify="right")
+            daily_table.add_column("Prompt", justify="right")
+            daily_table.add_column("Completion", justify="right")
+            daily_table.add_column("Elapsed (s)", justify="right")
+            for row in rows:
+                daily_table.add_row(
+                    row["date"],
+                    f"{row['total_calls']:,}",
+                    f"{row['total_prompt']:,}",
+                    f"{row['total_completion']:,}",
+                    f"{row['total_elapsed']:.1f}",
+                )
+            console.print()
+            console.print(daily_table)
+        else:
+            console.print("\n[dim]No daily rollup rows in range.[/]")
 
     store.close()
 

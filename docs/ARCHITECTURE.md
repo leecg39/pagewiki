@@ -212,7 +212,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.8 | 토큰 사용량 추적 + 파싱 재시도 + BM25 사전 랭킹 — 아래 §7.3 상세 |
 | v0.9 | 토큰 예산 + chat usage + /usage endpoint + cited 재정렬 — 아래 §7.4 상세 |
 | v0.10 | JSON-mode + SQLite usage + SSE 스트리밍 + context reuse — 아래 §7.5 상세 |
-| **v0.11** (현재) | **/chat/stream + usage 이벤트 + per-vault 캐시 + usage-report CLI** — 아래 §7.6 상세 |
+| v0.11 | /chat/stream + usage 이벤트 + per-vault 캐시 + usage-report CLI — 아래 §7.6 상세 |
+| **v0.12** (현재) | **WebSocket + daily 롤업 + cross-vault + 플러그인 server-mode** — 아래 §7.7 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -282,12 +283,22 @@ DELETE /chat/{sid}      # 세션 삭제
 | compile 토큰 추적 | cli.py `compile` | `--usage`/`--usage-db` 플래그 추가. `_make_chat_fn`에 tracker + store 주입해 entity extraction/page generation 양쪽 phase의 토큰 사용량 집계. |
 | Obsidian plugin v0.10 catch-up | obsidian-plugin/main.ts | 누락됐던 v0.8~v0.10 flag (`--usage`, `--max-tokens`, `--json-mode`, `--reuse-context`) 모두 설정 탭 + runAsk/ChatModal에 연결. |
 
-### 7.7 v0.12+ 향후 계획
+### 7.7 v0.12 상세
 
-- `/ask/stream` + `/chat/stream`을 WebSocket으로 확장 (양방향 interrupt 지원)
-- Usage persistence에 daily rollup 테이블 추가 (대용량 DB 쿼리 가속)
-- 멀티 vault에서 per-vault 별도 retrieval 루프 + cross-vault 답변 merging
-- Obsidian plugin의 `/chat/stream` 직접 소비 (현재는 CLI subprocess 경유)
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| WebSocket `/ask/ws` | server.py `ask_ws` | FastAPI WebSocket 엔드포인트. 양방향 메시지 프로토콜 (`ask`/`cancel`/`ping`). 서버는 `trace`/`usage`/`answer`/`cancelled`/`error`/`pong` 전송. 클라이언트가 `cancel`을 보내면 `threading.Event`로 retrieval loop에 신호 → 다음 iteration 시작 전 `should_stop` 콜백이 확인하고 clean abort. |
+| `should_stop` 콜백 | retrieval.py | `run_retrieval`에 `should_stop: Callable[[], bool] | None` 파라미터 추가. 매 iteration 시작 전 호출되어 True 반환 시 loop abort → `TraceStep("cancel", ...)` emit. WebSocket 외에도 임의 interrupt 구현 가능. |
+| Daily 롤업 | usage_store.py `rollup_day`, `rollup_range`, `query_daily`, `usage_daily` 테이블 | 대용량 usage DB에서 날짜별 집계 쿼리 가속. `rollup_day(date)`가 하루 분량을 pre-aggregate → `usage_daily` 테이블에 JSON phase breakdown 저장. `rollup_range(since, until)`로 범위 일괄 처리. `usage-report --daily`로 CLI 노출. 빈 날짜도 zero row를 한 번만 기록해 idempotent. |
+| Cross-vault retrieval | retrieval.py `run_cross_vault_retrieval` | 멀티 vault를 하나의 가상 루트로 merge하는 대신 **각 vault에서 독립적으로 full retrieval 실행 → 결과 synthesize**. 각 vault의 wiki-link 인덱스가 스코프 유지되어 spurious cross-vault 링크 해결 방지. `cited_nodes`는 `<vault_name>::` 프리픽스로 attribution. CLI `ask --per-vault` (멀티 vault 시에만 의미). |
+| 플러그인 server-mode | obsidian-plugin/main.ts `streamSSE`, `_runAskServerMode`, `_submitServerMode` | 새 `serverUrl` 설정이 비어있지 않으면 `fetch('/ask/stream')` 또는 `/chat/stream`로 직접 POST하고 SSE를 파싱. Node.js `ReadableStream` + 프레임 분리기로 `trace`/`usage`/`answer` 이벤트 처리. ChatModal은 live placeholder를 mutate해 스트리밍 중 진행 표시. session_id 자동 유지로 후속 질문이 서버-side history 활용. |
+
+### 7.8 v0.13+ 향후 계획
+
+- 플러그인에서 WebSocket 직접 소비 (cancel 버튼)
+- Usage DB에 rolling retention (오래된 raw events 삭제 후 rollup만 유지)
+- Cross-vault + decompose 조합
+- `run_retrieval`의 budget 분배 정책 (summarize vs retrieve 비율 tuning)
 
 ## 8. 명시적 비목표 (Non-Goals)
 

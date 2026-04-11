@@ -155,6 +155,7 @@ def run_retrieval(
     tracker: UsageTracker | None = None,
     json_mode: bool = False,
     reuse_context: bool = False,
+    should_stop: Callable[[], bool] | None = None,
 ) -> RetrievalResult:
     """Run the multi-hop reasoning loop.
 
@@ -232,8 +233,19 @@ def run_retrieval(
             return False
         return tracker.total_tokens >= max_tokens
 
+    def _should_stop() -> bool:
+        # v0.12: caller-controlled interrupt. Checked before every
+        # LLM call so a WebSocket cancel signal aborts mid-loop.
+        return should_stop is not None and should_stop()
+
     while iteration < max_iterations and len(gathered) < max_gathered:
         iteration += 1
+
+        # v0.12 caller interrupt check.
+        if _should_stop():
+            done_reason = "사용자 요청으로 중단"
+            _record(TraceStep("cancel", None, done_reason))
+            break
 
         # v0.9 token budget check — abort the loop if the caller-
         # specified cap has been hit. We check before every LLM call
@@ -668,6 +680,141 @@ def run_decomposed_retrieval(
         on_event(merged_trace[-1])
 
     total_iterations = sum(r.iterations_used for _, r in sub_results)
+    return RetrievalResult(
+        answer=final_answer,
+        cited_nodes=merged_cited,
+        trace=merged_trace,
+        iterations_used=total_iterations,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-vault retrieval (v0.12)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def run_cross_vault_retrieval(
+    query: str,
+    vault_roots: list[TreeNode],
+    chat_fn: ChatFn,
+    *,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    max_gathered: int = DEFAULT_MAX_GATHERED_NOTES,
+    link_indexes: list[LinkIndex | None] | None = None,
+    vault_labels: list[str] | None = None,
+    on_event: EventCallback = None,
+    max_tokens: int | None = None,
+    tracker: UsageTracker | None = None,
+    json_mode: bool = False,
+    reuse_context: bool = False,
+    should_stop: Callable[[], bool] | None = None,
+) -> RetrievalResult:
+    """Run a retrieval loop independently per vault, then synthesize (v0.12).
+
+    An alternative to the merged-tree ``scan_multi_vault`` approach:
+    instead of flattening all vaults into one virtual root (which
+    makes the LLM pick a vault first), we run the full retrieval
+    loop on each vault in isolation and then ask the LLM to
+    synthesize the per-vault answers into a single response.
+
+    Pros over flat merging:
+      * Each vault's link_index stays scoped — no spurious cross-
+        vault wiki-link resolution.
+      * Per-vault results are easier to attribute in the final
+        answer (the synthesis prompt names them).
+
+    Cons:
+      * N× the LLM calls (one full loop per vault).
+      * Budget is shared across all vaults when ``max_tokens`` is
+        set, so later vaults may hit the cap and return partial
+        results.
+
+    Args:
+        query: Original user question.
+        vault_roots: List of Layer 1 tree roots, one per vault.
+        chat_fn: LLM callable (shared across vaults).
+        link_indexes: Optional per-vault wiki-link indexes, same
+            length as ``vault_roots``. Missing entries are built
+            on-demand by ``run_retrieval``.
+        vault_labels: Optional per-vault human labels used in the
+            trace + synthesis prompt. Defaults to ``vault-{i}``.
+        All other kwargs forwarded to each per-vault ``run_retrieval``.
+    """
+    if not vault_roots:
+        raise ValueError("run_cross_vault_retrieval requires at least one vault")
+
+    n = len(vault_roots)
+    labels = vault_labels or [f"vault-{i + 1}" for i in range(n)]
+    indexes = link_indexes or [None] * n
+    if len(labels) != n or len(indexes) != n:
+        raise ValueError(
+            "vault_labels / link_indexes must match vault_roots length"
+        )
+
+    if on_event is not None:
+        on_event(
+            TraceStep(
+                "cross-vault",
+                None,
+                f"{n}개 vault에 대해 개별 retrieval 실행: {', '.join(labels)}",
+            )
+        )
+
+    per_vault_results: list[tuple[str, RetrievalResult]] = []
+    merged_cited: list[str] = []
+    merged_trace: list[TraceStep] = []
+
+    for i, (vault_root, label, link_idx) in enumerate(
+        zip(vault_roots, labels, indexes, strict=True)
+    ):
+        if on_event is not None:
+            on_event(
+                TraceStep(
+                    "cross-vault",
+                    None,
+                    f"[{i + 1}/{n}] {label} 탐색 시작",
+                )
+            )
+        sub_result = run_retrieval(
+            query,
+            vault_root,
+            chat_fn,
+            max_iterations=max_iterations,
+            max_gathered=max_gathered,
+            link_index=link_idx,
+            on_event=on_event,
+            max_tokens=max_tokens,
+            tracker=tracker,
+            json_mode=json_mode,
+            reuse_context=reuse_context,
+            should_stop=should_stop,
+        )
+        per_vault_results.append((label, sub_result))
+        merged_trace.extend(sub_result.trace)
+        for nid in sub_result.cited_nodes:
+            # Prefix with the vault label so same-named notes from
+            # different vaults stay distinguishable in the final list.
+            prefixed = f"{label}::{nid}"
+            if prefixed not in merged_cited:
+                merged_cited.append(prefixed)
+
+    # Synthesize using the existing multi-answer prompt format,
+    # treating each vault label as a "sub-question".
+    pairs = [(f"{label}에서 찾은 내용", result.answer) for label, result in per_vault_results]
+    synth_prompt = synthesize_multi_answer_prompt(query, pairs)
+    final_answer = chat_fn(synth_prompt).strip()
+
+    merged_trace.append(
+        TraceStep(
+            "cross-vault",
+            None,
+            f"synthesized {n} vault results into final answer",
+        )
+    )
+    if on_event is not None:
+        on_event(merged_trace[-1])
+
+    total_iterations = sum(r.iterations_used for _, r in per_vault_results)
     return RetrievalResult(
         answer=final_answer,
         cited_nodes=merged_cited,
