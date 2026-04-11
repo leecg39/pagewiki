@@ -70,6 +70,34 @@ def _make_chat_fn(model: str, num_ctx: int, tracker=None, usage_store=None):
     return _call
 
 
+def _make_system_chat_fn(model: str, num_ctx: int, tracker=None, usage_store=None):
+    """v0.14 prompt-caching chat_fn that takes separate (system, user).
+
+    Calls ``ollama_client.chat`` with the system prompt in the
+    ``system`` parameter so the LiteLLM + Ollama layer can keep the
+    KV cache for the stable prefix and only incrementally process
+    the user message. Tracker/store integration mirrors
+    ``_make_chat_fn``.
+    """
+    import time as _time
+
+    from .ollama_client import chat
+
+    def _call(system: str, user: str) -> str:
+        t0 = _time.time()
+        response = chat(user, model=model, num_ctx=num_ctx, system=system)
+        elapsed = _time.time() - t0
+        prompt_tokens = response.prompt_tokens or 0
+        completion_tokens = response.completion_tokens or 0
+        if tracker is not None:
+            tracker.record("other", prompt_tokens, completion_tokens, elapsed)
+        if usage_store is not None:
+            usage_store.record("other", prompt_tokens, completion_tokens, elapsed)
+        return response.text
+
+    return _call
+
+
 def _format_dangling_line(source_id: str, raw_target: str) -> str:
     """Format one dangling-link line for Rich console rendering.
 
@@ -222,6 +250,51 @@ def _open_cited_notes(
             subprocess.run(argv, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as e:
             console.print(f"  [red]Failed: {e}[/]")
+
+
+def _parse_token_split(
+    spec: str | None, total: int | None,
+) -> tuple[int | None, int | None, int | None]:
+    """Parse a ``summarize:retrieve:synth`` ratio into absolute caps (v0.14).
+
+    The three numbers are ratios (not percentages) and get
+    normalized by their sum before being multiplied against
+    ``total``. Returns ``(summarize_cap, retrieve_cap, synth_cap)``
+    or ``(None, None, None)`` when spec is empty.
+
+    ``total`` must be set when spec is set; otherwise raises
+    ``click.UsageError`` (caller should have validated).
+
+    The synth cap is currently informational — retrieval.run_retrieval
+    uses a single ``max_tokens`` cap that covers both traversal and
+    the final synthesis call. We pass ``retrieve_cap + synth_cap``
+    to it so the synthesis step has breathing room after the
+    traversal hits its own soft edge.
+    """
+    if not spec:
+        return None, None, None
+    if total is None:
+        raise click.UsageError(
+            "--token-split requires --max-tokens to be set",
+        )
+    parts = spec.split(":")
+    if len(parts) != 3:
+        raise click.UsageError(
+            "--token-split must be three numbers: SUMMARIZE:RETRIEVE:SYNTH",
+        )
+    try:
+        ratios = [float(p) for p in parts]
+    except ValueError as e:
+        raise click.UsageError(f"Invalid --token-split: {e}") from e
+    if any(r < 0 for r in ratios):
+        raise click.UsageError("--token-split values must be non-negative")
+    s = sum(ratios)
+    if s <= 0:
+        raise click.UsageError("--token-split values must sum to > 0")
+    summarize = max(1, int(total * ratios[0] / s))
+    retrieve = max(1, int(total * ratios[1] / s))
+    synth = max(1, int(total * ratios[2] / s))
+    return summarize, retrieve, synth
 
 
 def _resolve_multi_vault(
@@ -753,6 +826,18 @@ def watch(
     is_flag=True,
     help="Run retrieval independently per vault then synthesize (v0.12).",
 )
+@click.option(
+    "--token-split",
+    "token_split",
+    default=None,
+    help="Per-phase budget split, e.g. '20:60:20' = summarize:retrieve:synth (v0.14).",
+)
+@click.option(
+    "--prompt-cache",
+    "prompt_cache",
+    is_flag=True,
+    help="Send stable system prefixes separately for Ollama KV-cache reuse (v0.14).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -772,6 +857,8 @@ def ask(
     json_mode: bool,
     reuse_context: bool,
     per_vault: bool,
+    token_split: str | None,
+    prompt_cache: bool,
 ) -> None:
     """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
@@ -800,11 +887,33 @@ def ask(
     start = time.time()
 
     # v0.8: optional token usage tracking (v0.9: also auto-enabled
-    # when --max-tokens is set, since budget enforcement needs a
-    # tracker to compare against).
+    # when --max-tokens is set). v0.14: when --token-split is set
+    # we also always need a tracker so budget enforcement can work.
     from .usage import UsageTracker
-    tracker = UsageTracker() if (usage or max_tokens is not None) else None
+    tracker = UsageTracker() if (usage or max_tokens is not None or token_split) else None
     chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker)
+
+    # v0.14 optional prompt-caching chat_fn (split system/user).
+    system_chat_fn = None
+    if prompt_cache:
+        system_chat_fn = _make_system_chat_fn(model, num_ctx, tracker=tracker)
+
+    # v0.14 budget split: parse --token-split into per-phase caps.
+    summarize_cap, retrieve_cap, _synth_cap = _parse_token_split(
+        token_split, max_tokens,
+    )
+    # retrieve_cap covers BOTH traversal and the final synthesis call,
+    # so we combine it with the synth allowance. When split is None,
+    # the top-level max_tokens cap applies as usual.
+    if retrieve_cap is not None and _synth_cap is not None:
+        effective_retrieve_cap: int | None = retrieve_cap + _synth_cap
+    else:
+        effective_retrieve_cap = max_tokens
+    if token_split:
+        console.print(
+            f"[dim]token-split: summarize={summarize_cap:,}, "
+            f"retrieve+synth={effective_retrieve_cap:,}[/]"
+        )
 
     # Step 1: scan (multi-vault aware)
     if multi_vault:
@@ -839,7 +948,7 @@ def ask(
         sys.exit(1)
 
     # Step 2: summarize atomic notes (optional, cached, parallel in v0.7,
-    # per-vault cache routing in v0.11).
+    # per-vault cache routing in v0.11, budget-aware in v0.14).
     if not skip_summaries:
         console.print(
             f"[dim]2/4 Summarizing atomic notes (parallel: {max_workers} workers)...[/]"
@@ -856,6 +965,8 @@ def ask(
             summarized = summarize_atomic_notes(
                 root, chat_fn, summary_cache=scache, model_id=model,
                 max_workers=max_workers,
+                max_tokens=summarize_cap,
+                tracker=tracker,
             )
         console.print(f"[dim]    → {summarized} notes summarized (rest from cache)[/]")
     else:
@@ -960,7 +1071,7 @@ def ask(
             link_indexes=per_vault_indexes,
             vault_labels=per_vault_labels,
             on_event=_on_event,
-            max_tokens=max_tokens, tracker=tracker,
+            max_tokens=effective_retrieve_cap, tracker=tracker,
             json_mode=json_mode, reuse_context=reuse_context,
             decompose=decompose,  # v0.13 cross-vault × decompose
         )
@@ -968,15 +1079,16 @@ def ask(
         result = run_decomposed_retrieval(
             query, root, chat_fn,
             link_index=link_index, on_event=_on_event,
-            max_tokens=max_tokens, tracker=tracker,
+            max_tokens=effective_retrieve_cap, tracker=tracker,
             json_mode=json_mode, reuse_context=reuse_context,
         )
     else:
         result = run_retrieval(
             query, root, chat_fn,
             link_index=link_index, on_event=_on_event,
-            max_tokens=max_tokens, tracker=tracker,
+            max_tokens=effective_retrieve_cap, tracker=tracker,
             json_mode=json_mode, reuse_context=reuse_context,
+            system_chat_fn=system_chat_fn,
         )
 
     elapsed = time.time() - start
@@ -1504,6 +1616,13 @@ def serve(
     default="table",
     help="Output format. 'table' (default) uses Rich; csv/json are machine-readable (v0.13).",
 )
+@click.option(
+    "--prune-older-than",
+    "prune_days",
+    default=None,
+    type=int,
+    help="Delete raw events older than N days (rollups preserved) (v0.14).",
+)
 def usage_report(
     db_path: Path,
     since: str | None,
@@ -1512,6 +1631,7 @@ def usage_report(
     recent: int,
     daily: bool,
     output_format: str,
+    prune_days: int | None,
 ) -> None:
     """Query a SQLite usage database and print a Rich breakdown (v0.11).
 
@@ -1539,6 +1659,16 @@ def usage_report(
     until_ts = _parse_iso(until)
 
     store = UsageStore(db_path)
+
+    # v0.14: optional rolling retention. Rolls up affected days to
+    # preserve historical aggregates before deleting raw events.
+    if prune_days is not None and prune_days > 0:
+        deleted = store.prune_older_than_days(prune_days)
+        console.print(
+            f"[dim]Pruned {deleted:,} events older than {prune_days} days "
+            f"(daily rollups preserved).[/]"
+        )
+
     summary = store.query_summary(since=since_ts, until=until_ts)
 
     by_phase_items = list(summary.by_phase.items())

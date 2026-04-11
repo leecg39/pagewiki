@@ -66,6 +66,7 @@ from .vault import (
     scan_multi_vault,
     summarize_atomic_notes,
 )
+from .webui import build_ui_html
 from .wiki_links import LinkIndex, build_link_index
 
 ChatFn = Callable[[str], str]
@@ -179,7 +180,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
     """
     try:
         from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-        from fastapi.responses import StreamingResponse
+        from fastapi.responses import HTMLResponse, StreamingResponse
         from pydantic import BaseModel, Field
     except ImportError as e:
         raise RuntimeError(
@@ -188,7 +189,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.13.0")
+    app = FastAPI(title="pagewiki API", version="0.14.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -245,6 +246,26 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         persistent_total_prompt: int | None = None
         persistent_total_completion: int | None = None
 
+    class UsageEventOut(BaseModel):
+        timestamp: float
+        phase: str
+        prompt: int
+        completion: int
+        elapsed: float
+
+    class UsageDailyOut(BaseModel):
+        date: str
+        total_calls: int
+        total_prompt: int
+        total_completion: int
+        total_elapsed: float
+        by_phase: dict[str, dict]
+
+    class UsageHistoryResponse(BaseModel):
+        summary: UsageResponse
+        events: list[UsageEventOut]
+        daily: list[UsageDailyOut]
+
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _trace_to_out(trace: list[TraceStep]) -> list[TraceStepOut]:
@@ -284,12 +305,25 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
 
     # ── Endpoints ──────────────────────────────────────────────────────────
 
+    # ── v0.14 Web UI ──────────────────────────────────────────────────────
+
+    @app.get("/", response_class=HTMLResponse)
+    def web_ui() -> "HTMLResponse":
+        """Return the embedded single-page Web UI (v0.14).
+
+        The HTML is self-contained (no external CSS/JS) so opening
+        ``http://localhost:8000/`` in a browser gives an immediate
+        chat-like interface over ``/ask/stream``. Set
+        ``PAGEWIKI_UI_HTML`` to point at a custom HTML file.
+        """
+        return HTMLResponse(build_ui_html())
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.13.0",
+            "version": "0.14.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -402,6 +436,125 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         """Clear the cumulative usage tracker (v0.9)."""
         state.tracker.events.clear()
         return {"status": "reset"}
+
+    @app.get("/usage/history", response_model=UsageHistoryResponse)
+    def usage_history(
+        since: str | None = None,
+        until: str | None = None,
+        phase: str | None = None,
+        limit: int = 100,
+        include_daily: bool = True,
+    ) -> UsageHistoryResponse:
+        """Query historical usage from the SQLite store (v0.14).
+
+        Returns a combined payload of:
+          * ``summary``  — cumulative totals over the window, with
+                           phase-broken down. Includes current-session
+                           in-memory tracker state.
+          * ``events``   — the ``limit`` most recent raw events in the
+                           window (or fewer if the store is smaller).
+          * ``daily``    — per-day rollup rows in the window (empty
+                           when ``include_daily=False``).
+
+        Query parameters:
+          * ``since``    — ISO date or timestamp (events >= this).
+          * ``until``    — ISO date or timestamp (events < this).
+          * ``phase``    — restrict to a single phase bucket.
+          * ``limit``    — max recent events (default 100).
+          * ``include_daily`` — include the daily rollup list.
+
+        Returns ``503`` if the server wasn't started with
+        ``--usage-db`` (no persistent store).
+        """
+        if state.usage_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Usage persistence is not enabled. "
+                "Start `pagewiki serve --usage-db PATH`.",
+            )
+
+        def _parse(s: str | None) -> float | None:
+            if s is None:
+                return None
+            try:
+                from datetime import datetime as _dt
+                return _dt.fromisoformat(s).timestamp()
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid ISO timestamp: {s}",
+                ) from e
+
+        since_ts = _parse(since)
+        until_ts = _parse(until)
+
+        store_summary = state.usage_store.query_summary(
+            since=since_ts, until=until_ts,
+        )
+
+        # Build the summary response using SAME shape as /usage so
+        # clients can reuse the parser. Mix in-memory tracker (current
+        # session) with persistent totals.
+        t = state.tracker
+        summary_resp = UsageResponse(
+            total_calls=t.total_calls,
+            total_prompt_tokens=t.total_prompt_tokens,
+            total_completion_tokens=t.total_completion_tokens,
+            total_tokens=t.total_tokens,
+            total_elapsed=t.total_elapsed,
+            by_phase={
+                p: PhaseUsage(
+                    calls=int(b["calls"]),
+                    prompt=int(b["prompt"]),
+                    completion=int(b["completion"]),
+                    elapsed=float(b["elapsed"]),
+                )
+                for p, b in store_summary.by_phase.items()
+            },
+            persistent_total_calls=store_summary.total_calls,
+            persistent_total_prompt=store_summary.total_prompt,
+            persistent_total_completion=store_summary.total_completion,
+        )
+
+        events = state.usage_store.query_events(
+            since=since_ts,
+            until=until_ts,
+            phase=phase,
+            limit=limit,
+        )
+        event_out = [
+            UsageEventOut(
+                timestamp=e.timestamp,
+                phase=e.phase,
+                prompt=e.prompt,
+                completion=e.completion,
+                elapsed=e.elapsed,
+            )
+            for e in events
+        ]
+
+        daily_out: list[UsageDailyOut] = []
+        if include_daily:
+            # Rollup any missing days before querying so the response
+            # reflects the latest state.
+            state.usage_store.rollup_range(since=since, until=until)
+            for row in state.usage_store.query_daily(since=since, until=until):
+                daily_out.append(
+                    UsageDailyOut(
+                        date=row["date"],
+                        total_calls=row["total_calls"],
+                        total_prompt=row["total_prompt"],
+                        total_completion=row["total_completion"],
+                        total_elapsed=row["total_elapsed"],
+                        by_phase=row["by_phase"],
+                    )
+                )
+
+        return UsageHistoryResponse(
+            summary=summary_resp,
+            events=event_out,
+            daily=daily_out,
+        )
 
     # ── v0.10/v0.11 SSE streaming endpoints ───────────────────────────────
 

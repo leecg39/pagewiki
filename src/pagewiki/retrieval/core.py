@@ -13,11 +13,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..prompts import (
+    EVALUATE_SYSTEM,
+    FINAL_ANSWER_SYSTEM,
+    SELECT_NODE_SYSTEM,
     NodeSummary,
     build_retry_prompt,
     evaluate_prompt,
     evaluate_prompt_json,
+    evaluate_user_prompt,
     final_answer_prompt,
+    final_answer_user_prompt,
     final_answer_with_history_prompt,
     parse_evaluate_response,
     parse_evaluate_response_json,
@@ -25,6 +30,7 @@ from ..prompts import (
     parse_select_response_json,
     select_node_prompt,
     select_node_prompt_json,
+    select_node_user_prompt,
 )
 from ..tree import TreeNode
 from ..wiki_links import LinkIndex, build_link_index
@@ -35,6 +41,7 @@ from .types import (
     ChatFn,
     EventCallback,
     RetrievalResult,
+    SystemChatFn,
     TraceStep,
 )
 
@@ -57,12 +64,27 @@ def run_retrieval(
     json_mode: bool = False,
     reuse_context: bool = False,
     should_stop: Callable[[], bool] | None = None,
+    system_chat_fn: SystemChatFn | None = None,
 ) -> RetrievalResult:
     """Run the multi-hop reasoning loop.
 
     See ``retrieval/__init__.py`` for parameter documentation — kept
     brief here because this module is internal.
+
+    v0.14 ``system_chat_fn``: when provided, the select/evaluate/final
+    phases use user-only prompt variants (``select_node_user_prompt``
+    etc.) and invoke ``system_chat_fn(system, user)`` instead of the
+    regular ``chat_fn(prompt)``. The ``system`` argument is the
+    appropriate stable constant from ``prompts`` (``SELECT_NODE_SYSTEM``,
+    ``EVALUATE_SYSTEM``, ``FINAL_ANSWER_SYSTEM``). Keeping the system
+    prefix identical across calls lets Ollama reuse the KV cache for
+    the prefix tokens, cutting repeat-call latency substantially.
+
+    Note that JSON-mode and history-aware final answers still use
+    the full (system+user) prompt path — the caching opt-in only
+    applies to the plain-text code path.
     """
+    use_prompt_cache = system_chat_fn is not None
     trace: list[TraceStep] = []
 
     def _record(step: TraceStep) -> None:
@@ -175,6 +197,12 @@ def run_retrieval(
             prompt = select_node_prompt_json(
                 query, summaries, path_so_far=effective_path or None,
             )
+        elif use_prompt_cache:
+            # v0.14 prompt caching: send the stable SELECT system
+            # preamble separately so Ollama can reuse its KV cache.
+            prompt = select_node_user_prompt(
+                query, summaries, path_so_far=effective_path or None,
+            )
         else:
             prompt = select_node_prompt(
                 query, summaries, path_so_far=effective_path or None,
@@ -183,7 +211,10 @@ def run_retrieval(
         for s in summaries:
             shown_ids.add(s.node_id)
 
-        response = chat_fn(prompt)
+        if use_prompt_cache and not json_mode:
+            response = system_chat_fn(SELECT_NODE_SYSTEM, prompt)
+        else:
+            response = chat_fn(prompt)
 
         _select_parser = (
             parse_select_response_json if json_mode else parse_select_response
@@ -195,7 +226,11 @@ def run_retrieval(
             _record(
                 TraceStep("select", None, f"parse error (retrying): {e}")
             )
-            retry_response = chat_fn(build_retry_prompt(prompt, str(e)))
+            retry_prompt = build_retry_prompt(prompt, str(e))
+            if use_prompt_cache and not json_mode:
+                retry_response = system_chat_fn(SELECT_NODE_SYSTEM, retry_prompt)
+            else:
+                retry_response = chat_fn(retry_prompt)
             try:
                 action, value = _select_parser(retry_response)
                 _record(TraceStep("select", None, "retry succeeded"))
@@ -268,9 +303,13 @@ def run_retrieval(
 
         if json_mode:
             eval_prompt = evaluate_prompt_json(query, picked.title, content)
+            eval_response = chat_fn(eval_prompt)
+        elif use_prompt_cache:
+            eval_prompt = evaluate_user_prompt(query, picked.title, content)
+            eval_response = system_chat_fn(EVALUATE_SYSTEM, eval_prompt)
         else:
             eval_prompt = evaluate_prompt(query, picked.title, content)
-        eval_response = chat_fn(eval_prompt)
+            eval_response = chat_fn(eval_prompt)
 
         _eval_parser = (
             parse_evaluate_response_json if json_mode else parse_evaluate_response
@@ -329,8 +368,13 @@ def run_retrieval(
             parts.append(f"\n## {title}\n{content[:1000]}")
         answer = "\n".join(parts)
     elif history:
+        # History-aware final answer still uses the full (system+user)
+        # path — caching doesn't help since the history content varies.
         final_prompt = final_answer_with_history_prompt(query, gathered, history)
         answer = chat_fn(final_prompt).strip()
+    elif use_prompt_cache:
+        final_user = final_answer_user_prompt(query, gathered)
+        answer = system_chat_fn(FINAL_ANSWER_SYSTEM, final_user).strip()
     else:
         final_prompt = final_answer_prompt(query, gathered)
         answer = chat_fn(final_prompt).strip()

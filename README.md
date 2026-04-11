@@ -137,6 +137,21 @@ pagewiki ask "X vs Y 비교" --vault ~/Research --extra-vault ~/Work --per-vault
 pagewiki usage-report --db ~/.pagewiki/usage.db --format json > report.json
 pagewiki usage-report --db ~/.pagewiki/usage.db --format csv --recent 50 > events.csv
 
+# Rolling retention (v0.14+): 오래된 raw event 삭제 후 rollup만 유지
+pagewiki usage-report --db ~/.pagewiki/usage.db --prune-older-than 30
+
+# 3-phase 예산 분배 (v0.14+): summarize:retrieve:synthesis 비율 조정
+pagewiki ask "query" --max-tokens 50000 --token-split 20:60:20
+
+# Prompt caching (v0.14+): stable system 프리픽스로 Ollama KV-cache 재사용
+pagewiki ask "query" --prompt-cache
+
+# Web UI (v0.14+): `pagewiki serve` 실행 후 브라우저에서 http://localhost:8000/
+# 접속하면 embedded 단일 페이지 UI가 /ask/stream을 직접 호출
+pagewiki serve --vault ~/Research --usage-db ~/.pagewiki/usage.db
+# → http://localhost:8000/        (Web UI)
+# → http://localhost:8000/usage/history  (historical usage JSON)
+
 # LLM-Wiki 컴파일 (v0.3+): entity 추출 → 위키 페이지 자동 생성
 pagewiki compile --folder Research             # → {vault}/LLM-Wiki/
 
@@ -184,7 +199,8 @@ pagewiki ask "query" --vault "~/Documents/Obsidian Vault" --model ollama/gemma4:
 - v0.10: JSON-mode 프롬프트 (`--json-mode`), SQLite usage 영속화 (`serve --usage-db`), SSE 스트리밍 (`POST /ask/stream`), 컨텍스트 reuse (`--reuse-context`)
 - v0.11: `POST /chat/stream` SSE + 라이브 usage 이벤트, 멀티 vault per-vault 캐시 분리, `pagewiki usage-report` 명령, compile 토큰 추적, Obsidian 플러그인 v0.10 flags
 - v0.12: WebSocket `/ask/ws` (양방향, cancel 지원), daily usage 롤업 (`usage-report --daily`), cross-vault retrieval (`--per-vault`), Obsidian 플러그인 server-mode (SSE 직접 소비)
-- **v0.13 (현재)**: chat에도 `--json-mode`/`--reuse-context` 노출, SSE usage 이벤트가 실제 LiteLLM 토큰 카운트 사용, 플러그인 WebSocket + Cancel 버튼, cross-vault × decompose 조합, `usage-report --format csv/json`, `retrieval.py` → `retrieval/` 서브패키지 분할
+- v0.13: chat에도 `--json-mode`/`--reuse-context` 노출, SSE usage 이벤트가 실제 LiteLLM 토큰 카운트 사용, 플러그인 WebSocket + Cancel 버튼, cross-vault × decompose 조합, `usage-report --format csv/json`, `retrieval.py` → `retrieval/` 서브패키지 분할
+- **v0.14 (현재)**: Usage DB rolling retention (`--prune-older-than`), `GET /usage/history` 엔드포인트, embedded Web UI (`GET /`), 3-phase 토큰 예산 분배 (`--token-split`), Ollama KV-cache 프롬프트 재사용 (`--prompt-cache`)
 
 ## Obsidian 플러그인 (v0.6)
 

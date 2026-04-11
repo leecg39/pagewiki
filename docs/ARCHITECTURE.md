@@ -158,8 +158,9 @@ pagewiki/
 │   ├── logger.py             # QueryRecord → .pagewiki-log
 │   ├── server.py             # FastAPI HTTP 서버 (v0.7, optional)
 │   ├── usage.py              # 토큰 사용량 추적 (v0.8)
-│   ├── usage_store.py        # SQLite usage 영속화 (v0.10)
+│   ├── usage_store.py        # SQLite usage 영속화 + daily rollup (v0.10, retention v0.14)
 │   ├── ranking.py            # BM25-style 후보 사전 랭킹 (v0.8)
+│   ├── webui.py              # Embedded self-contained Web UI (v0.14)
 │   └── _vendor/pageindex/    # 번들된 PageIndex SDK (MIT)
 ├── obsidian-plugin/
 │   ├── main.ts               # Obsidian 플러그인 (Scan/Ask/Chat/Compile/Watch)
@@ -220,7 +221,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.10 | JSON-mode + SQLite usage + SSE 스트리밍 + context reuse — 아래 §7.5 상세 |
 | v0.11 | /chat/stream + usage 이벤트 + per-vault 캐시 + usage-report CLI — 아래 §7.6 상세 |
 | v0.12 | WebSocket + daily 롤업 + cross-vault + 플러그인 server-mode — 아래 §7.7 상세 |
-| **v0.13** (현재) | **폴리싱 + 리팩토링 — chat flags, real tokens, plugin Cancel, cross-vault×decompose, CSV/JSON, retrieval split** — 아래 §7.8 상세 |
+| v0.13 | 폴리싱 + 리팩토링 — chat flags, real tokens, plugin Cancel, cross-vault×decompose, CSV/JSON, retrieval split — 아래 §7.8 상세 |
+| **v0.14** (현재) | **DB 정리 + `/usage/history` + Web UI + 예산 분배 + 프롬프트 캐싱** — 아래 §7.9 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -311,13 +313,23 @@ DELETE /chat/{sid}      # 세션 삭제
 | usage-report CSV/JSON | cli.py `usage_report`, `--format` 옵션 | `--format json` / `--format csv` 머신 출력. Rich 마크업 없이 `click.echo`로 clean stdout. JSON은 total + by_phase + recent + daily 통합 페이로드, CSV는 section-tagged rows. |
 | retrieval 패키지 분할 | src/pagewiki/retrieval/{types,helpers,core,decompose,cross_vault}.py | 846줄 단일 파일을 5개 모듈 subpackage로 분할. `__init__.py`가 public API 재노출해 기존 import 호환 유지 (`from pagewiki.retrieval import run_retrieval` 그대로 작동). |
 
-### 7.9 v0.14+ 향후 계획
+### 7.9 v0.14 상세
 
-- Usage DB rolling retention (오래된 raw events 삭제 후 rollup만 유지)
-- Budget 분배 정책 (summarize vs retrieve 비율 tuning, `--token-split`)
-- `/usage/history` 엔드포인트로 서버에서 바로 historical 쿼리
-- Prompt caching (Ollama 지원 시)
-- Web UI (`pagewiki serve`에 간단한 HTML frontend)
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| Usage DB rolling retention | usage_store.py `prune_events_before`, `prune_older_than_days` | 오래된 `usage_events` 행을 삭제하기 전에 영향받는 날짜들을 `usage_daily` 로 rollup해서 historical 집계는 보존. VACUUM으로 파일 크기 즉시 회수. CLI `usage-report --prune-older-than N` 로 노출. |
+| `GET /usage/history` | server.py `usage_history` + `UsageHistoryResponse` | `since`/`until`/`phase`/`limit` 쿼리 파라미터로 SQLite store를 직접 조회. 응답에 `summary` (in-memory + persistent), `events` (raw), `daily` (rollup)를 묶어 반환. `--usage-db` 없이 실행된 서버는 503. |
+| Web UI | webui.py `build_ui_html`, server.py `web_ui` | 외부 CSS/JS/빌드 없는 self-contained 단일 페이지. `fetch` + `ReadableStream`으로 `/ask/stream` SSE 소비. Decompose/JSON/Reuse 토글 + Cancel 버튼 + 라이브 토큰 미터. `PAGEWIKI_UI_HTML` env로 커스텀 HTML 교체 가능. `GET /` 로 서빙. |
+| Budget split 정책 | cli.py `_parse_token_split`, vault.py `summarize_atomic_notes(max_tokens=...)` | `--token-split A:B:C` 로 `--max-tokens`를 summarize/retrieve/synthesis 3단계에 비례 분배. summarize는 soft cap (넘으면 남은 노트 건너뛰고 제목만 사용), retrieve는 기존 hard cap 재사용. 비율은 정규화되므로 `20:60:20`과 `1:3:1`이 동일. |
+| Prompt caching | prompts.py `SELECT_NODE_SYSTEM` 등 + `*_user_prompt`, retrieval/core.py `system_chat_fn` | Select/Evaluate/Final 프롬프트를 `(system, user)` 쌍으로 분리. CLI `--prompt-cache` 활성 시 `ollama_client.chat(user, system=SELECT_NODE_SYSTEM)` 으로 호출해 Ollama가 stable prefix의 KV cache를 재사용. history-aware final 답변과 JSON-mode는 기존 concat 경로 유지 (내용이 call 마다 달라서 캐싱 효과 없음). |
+
+### 7.10 v0.15+ 향후 계획
+
+- Plugin WebSocket mode에서 `--token-split` 노출
+- `/usage/history` 에 SSE streaming (long polling 대안)
+- Web UI에 usage chart (간단한 sparkline)
+- Prompt cache 히트율 측정/로깅
+- 멀티 vault에서 cross-vault retrieval 병렬 실행 (현재는 순차)
 
 ## 8. 명시적 비목표 (Non-Goals)
 
