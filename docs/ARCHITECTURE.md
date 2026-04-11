@@ -151,6 +151,8 @@ pagewiki/
 │   ├── ollama_client.py      # LiteLLM + Ollama 래퍼
 │   ├── logger.py             # QueryRecord → .pagewiki-log
 │   ├── server.py             # FastAPI HTTP 서버 (v0.7, optional)
+│   ├── usage.py              # 토큰 사용량 추적 (v0.8)
+│   ├── ranking.py            # BM25-style 후보 사전 랭킹 (v0.8)
 │   └── _vendor/pageindex/    # 번들된 PageIndex SDK (MIT)
 ├── obsidian-plugin/
 │   ├── main.ts               # Obsidian 플러그인 (Scan/Ask/Chat/Compile/Watch)
@@ -205,7 +207,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.4 | 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 vault 파일 변경 실시간 감지 |
 | v0.5 | Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile/Watch 실행, Settings 탭, 결과 모달 |
 | v0.6 | 대화형 모드 + 캐시 + 필터 + 스트리밍 — 아래 §7.1 상세 |
-| **v0.7** (현재) | **병렬 LLM + 멀티쿼리 분해 + 멀티 vault + API 서버** — 아래 §7.2 상세 |
+| v0.7 | 병렬 LLM + 멀티쿼리 분해 + 멀티 vault + API 서버 — 아래 §7.2 상세 |
+| **v0.8** (현재) | **토큰 사용량 추적 + 파싱 재시도 + BM25 사전 랭킹** — 아래 §7.3 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -237,12 +240,21 @@ DELETE /chat/{sid}      # 세션 삭제
 
 세션은 in-process dict로 관리, 1시간 비활성 시 자동 만료.
 
-### 7.3 v0.8+ 향후 계획
+### 7.3 v0.8 상세
 
-- 구조화 출력 검증 (Pydantic 기반 LLM 응답 파싱)
-- BM25-style 사전 relevance 스코어링
-- 실제 토큰 카운팅 + 예산 관리 (현재는 char/3 휴리스틱)
-- 컨텍스트 reuse: ToC review 증분 업데이트
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| 토큰 사용량 추적 | usage.py `UsageTracker` | 스레드 안전 counter. `chat_fn` 래퍼가 매 호출을 phase(summarize/select/evaluate/final/...)별로 기록. `ask --usage`로 terminal에 Rich 테이블 출력. |
+| 파싱 재시도 | prompts.py `build_retry_prompt`, retrieval.py | SELECT 응답이 malformed일 때 stricter format reminder를 append해 한 번 더 시도. 기존에는 loop가 즉시 abort됐지만 이제 자동 복구. |
+| BM25 사전 랭킹 | ranking.py | Zero-LLM 비용의 candidate 사전 정렬. 토큰 overlap 기반 BM25-style 스코어 + 짧은 후보 보너스. 정렬된 목록을 SELECT 프롬프트에 전달 → LLM이 적은 iteration으로 정답 도달. Korean/English 혼용 vault 지원. |
+| 서버 엔드포인트 테스트 | tests/test_server.py | FastAPI `TestClient` 기반 11개 테스트. /health, /scan, /ask, /chat (세션 생성/누적/삭제/만료) 검증. FastAPI 미설치 시 `pytest.importorskip`로 clean skip. |
+
+### 7.4 v0.9+ 향후 계획
+
+- Pydantic JSON-mode 출력 (LLM이 JSON으로 응답 → strict 파싱)
+- 컨텍스트 reuse: 반복 iteration 시 ToC 델타만 재전송
+- Usage 예산 제한 (`--max-tokens`로 쿼리당 예산 하드 캡)
+- Re-ranking: gathered notes를 LLM에 다시 물어 최종 인용 우선순위 정렬
 
 ## 8. 명시적 비목표 (Non-Goals)
 

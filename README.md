@@ -136,7 +136,8 @@ pagewiki ask "query" --vault "~/Documents/Obsidian Vault" --model ollama/gemma4:
 - v0.4: 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 파일 변경 실시간 감지
 - v0.5: Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile 실행, Settings 탭, 결과 모달
 - v0.6: 대화형 `chat` 모드, atomic summary 디스크 캐시, YAML frontmatter 필터 (`--tag`/`--after`/`--before`), 실시간 스트리밍 출력
-- **v0.7 (현재)**: 병렬 LLM 호출 (`--max-workers`), 멀티쿼리 분해 (`--decompose`), 멀티 vault 검색 (`--extra-vault`), HTTP API 서버 (`pagewiki serve`)
+- v0.7: 병렬 LLM 호출 (`--max-workers`), 멀티쿼리 분해 (`--decompose`), 멀티 vault 검색 (`--extra-vault`), HTTP API 서버 (`pagewiki serve`)
+- **v0.8 (현재)**: 토큰 사용량 추적 (`--usage`), SELECT 파싱 실패 시 자동 재시도, BM25 기반 후보 사전 랭킹, 서버 엔드포인트 테스트
 
 ## Obsidian 플러그인 (v0.6)
 

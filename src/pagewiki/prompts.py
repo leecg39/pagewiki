@@ -114,6 +114,22 @@ def parse_select_response(response: str) -> tuple[str, str]:
     raise ValueError(f"Could not parse SELECT/DONE from response: {response!r}")
 
 
+def build_retry_prompt(original_prompt: str, error_reason: str) -> str:
+    """Append a retry reminder to ``original_prompt`` for v0.8 parse retry.
+
+    When the LLM produces unparseable output, we re-send the prompt
+    with a terse note reiterating the format requirement. This is
+    cheaper than a full rewrite and empirically recovers most
+    Gemma 4 format slips.
+    """
+    return (
+        original_prompt
+        + "\n\n[재시도 요청] 이전 응답을 파싱할 수 없습니다 "
+        + f"(오류: {error_reason}).\n"
+        + "지정된 형식 외의 텍스트는 절대 포함하지 마세요."
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 3: Extract & Evaluate
 # ─────────────────────────────────────────────────────────────────────────────

@@ -33,16 +33,38 @@ from .vault import (
 console = Console()
 
 
-def _make_chat_fn(model: str, num_ctx: int):
+def _make_chat_fn(model: str, num_ctx: int, tracker=None):
     """Build a chat_fn closure bound to a specific Ollama model.
 
     Imported lazily so `pagewiki scan` works even when LiteLLM / Ollama are
     not installed locally.
+
+    When ``tracker`` is provided, every call is recorded with real
+    prompt/completion token counts from LiteLLM (v0.8).
     """
     from .ollama_client import chat
 
+    if tracker is None:
+        def _call(prompt: str) -> str:
+            return chat(prompt, model=model, num_ctx=num_ctx).text
+        return _call
+
+    # Wrap so each call lands in the tracker. The phase label is
+    # ``other`` by default; retrieval/compile sites can re-wrap the
+    # returned fn with make_tracking_str_chat_fn for finer buckets.
+    import time as _time
+
     def _call(prompt: str) -> str:
-        return chat(prompt, model=model, num_ctx=num_ctx).text
+        t0 = _time.time()
+        response = chat(prompt, model=model, num_ctx=num_ctx)
+        elapsed = _time.time() - t0
+        tracker.record(
+            "other",
+            response.prompt_tokens or 0,
+            response.completion_tokens or 0,
+            elapsed,
+        )
+        return response.text
 
     return _call
 
@@ -650,6 +672,11 @@ def watch(
     is_flag=True,
     help="Decompose complex queries into sub-questions and synthesize answers (v0.7).",
 )
+@click.option(
+    "--usage",
+    is_flag=True,
+    help="Print token usage breakdown at the end of the query (v0.8).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -664,6 +691,7 @@ def ask(
     filter_before: str | None,
     max_workers: int,
     decompose: bool,
+    usage: bool,
 ) -> None:
     """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
@@ -690,7 +718,11 @@ def ask(
     vault = primary
 
     start = time.time()
-    chat_fn = _make_chat_fn(model, num_ctx)
+
+    # v0.8: optional token usage tracking.
+    from .usage import UsageTracker
+    tracker = UsageTracker() if usage else None
+    chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker)
 
     # Step 1: scan (multi-vault aware)
     if multi_vault:
@@ -807,6 +839,33 @@ def ask(
     console.print(
         f"\n[dim]iterations={result.iterations_used}  elapsed={elapsed:.1f}s[/]"
     )
+
+    # v0.8: print usage summary if tracking is enabled.
+    if tracker is not None and tracker.total_calls > 0:
+        usage_table = Table(title="Token Usage (v0.8)")
+        usage_table.add_column("Phase", style="bold")
+        usage_table.add_column("Calls", justify="right")
+        usage_table.add_column("Prompt", justify="right")
+        usage_table.add_column("Completion", justify="right")
+        usage_table.add_column("Elapsed (s)", justify="right")
+
+        for phase, bucket in sorted(tracker.by_phase().items()):
+            usage_table.add_row(
+                phase,
+                str(int(bucket["calls"])),
+                f"{int(bucket['prompt']):,}",
+                f"{int(bucket['completion']):,}",
+                f"{bucket['elapsed']:.1f}",
+            )
+        usage_table.add_row(
+            "[bold]TOTAL",
+            str(tracker.total_calls),
+            f"[bold]{tracker.total_prompt_tokens:,}",
+            f"[bold]{tracker.total_completion_tokens:,}",
+            f"[bold]{tracker.total_elapsed:.1f}",
+        )
+        console.print()
+        console.print(usage_table)
 
     record = QueryRecord(
         query=query,

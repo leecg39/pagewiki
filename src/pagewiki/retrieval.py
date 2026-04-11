@@ -22,6 +22,7 @@ from pathlib import Path
 
 from .prompts import (
     NodeSummary,
+    build_retry_prompt,
     decompose_query_prompt,
     evaluate_prompt,
     final_answer_prompt,
@@ -228,6 +229,23 @@ def run_retrieval(
         for node, label in xref_candidates:
             summaries.append(_node_as_summary(node, linked_from=label))
 
+        # v0.8: pre-rank candidates by BM25-style term overlap so the
+        # most likely matches appear first in the prompt. This is a
+        # zero-LLM hint that helps the model land on the right node
+        # in fewer iterations on large vaults.
+        if len(summaries) > 1:
+            from .ranking import rank_candidates
+
+            searchable = [
+                (s.title, f"{s.title} {s.summary or ''}")
+                for s in summaries
+            ]
+            order = rank_candidates(query, searchable)
+            reordered_summaries = [summaries[i] for i, _ in order]
+            reordered_candidates = [candidates[i] for i, _ in order]
+            summaries = reordered_summaries
+            candidates = reordered_candidates
+
         prompt = select_node_prompt(
             query,
             summaries,
@@ -238,9 +256,23 @@ def run_retrieval(
         try:
             action, value = parse_select_response(response)
         except ValueError as e:
-            _record(TraceStep("select", None, f"parse error: {e}"))
-            done_reason = f"응답 파싱 실패: {e}"
-            break
+            # v0.8 parse-retry: give the LLM one more chance with a
+            # stricter format reminder before aborting the loop.
+            _record(
+                TraceStep(
+                    "select",
+                    None,
+                    f"parse error (retrying): {e}",
+                )
+            )
+            retry_response = chat_fn(build_retry_prompt(prompt, str(e)))
+            try:
+                action, value = parse_select_response(retry_response)
+                _record(TraceStep("select", None, "retry succeeded"))
+            except ValueError as e2:
+                _record(TraceStep("select", None, f"retry failed: {e2}"))
+                done_reason = f"응답 파싱 실패: {e2}"
+                break
 
         if action == "DONE":
             _record(TraceStep("select", None, f"DONE: {value}"))
