@@ -149,8 +149,12 @@ pagewiki ask "query" --prompt-cache
 # Web UI (v0.14+): `pagewiki serve` 실행 후 브라우저에서 http://localhost:8000/
 # 접속하면 embedded 단일 페이지 UI가 /ask/stream을 직접 호출
 pagewiki serve --vault ~/Research --usage-db ~/.pagewiki/usage.db
-# → http://localhost:8000/        (Web UI)
-# → http://localhost:8000/usage/history  (historical usage JSON)
+# → http://localhost:8000/        (Web UI + v0.15 sparkline)
+# → http://localhost:8000/usage/history          (historical usage JSON)
+# → http://localhost:8000/usage/history/stream   (v0.15 SSE tail -f)
+
+# Cross-vault 병렬 (v0.15+): 각 vault를 동시에 탐색 (--max-workers로 폴 크기)
+pagewiki ask "query" --vault v1 --extra-vault v2 --extra-vault v3 --per-vault --max-workers 3
 
 # LLM-Wiki 컴파일 (v0.3+): entity 추출 → 위키 페이지 자동 생성
 pagewiki compile --folder Research             # → {vault}/LLM-Wiki/
@@ -200,7 +204,8 @@ pagewiki ask "query" --vault "~/Documents/Obsidian Vault" --model ollama/gemma4:
 - v0.11: `POST /chat/stream` SSE + 라이브 usage 이벤트, 멀티 vault per-vault 캐시 분리, `pagewiki usage-report` 명령, compile 토큰 추적, Obsidian 플러그인 v0.10 flags
 - v0.12: WebSocket `/ask/ws` (양방향, cancel 지원), daily usage 롤업 (`usage-report --daily`), cross-vault retrieval (`--per-vault`), Obsidian 플러그인 server-mode (SSE 직접 소비)
 - v0.13: chat에도 `--json-mode`/`--reuse-context` 노출, SSE usage 이벤트가 실제 LiteLLM 토큰 카운트 사용, 플러그인 WebSocket + Cancel 버튼, cross-vault × decompose 조합, `usage-report --format csv/json`, `retrieval.py` → `retrieval/` 서브패키지 분할
-- **v0.14 (현재)**: Usage DB rolling retention (`--prune-older-than`), `GET /usage/history` 엔드포인트, embedded Web UI (`GET /`), 3-phase 토큰 예산 분배 (`--token-split`), Ollama KV-cache 프롬프트 재사용 (`--prompt-cache`)
+- v0.14: Usage DB rolling retention (`--prune-older-than`), `GET /usage/history` 엔드포인트, embedded Web UI (`GET /`), 3-phase 토큰 예산 분배 (`--token-split`), Ollama KV-cache 프롬프트 재사용 (`--prompt-cache`)
+- **v0.15 (현재)**: Cross-vault retrieval 병렬 실행, Prompt cache 히트율 측정, `GET /usage/history/stream` SSE tail, 플러그인 WebSocket이 token_split/max_tokens/json_mode/reuse_context 전송, Web UI sparkline 차트
 
 ## Obsidian 플러그인 (v0.6)
 

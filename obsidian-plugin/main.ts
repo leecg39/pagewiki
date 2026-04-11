@@ -53,6 +53,10 @@ interface PageWikiSettings {
 	// v0.13 — prefer WebSocket /ask/ws over SSE /ask/stream so
 	// in-flight queries can be cancelled via the Cancel button.
 	useWebSocket: boolean;
+	// v0.15 — per-phase token budget split
+	// (summarize:retrieve:synthesis). Only meaningful when
+	// ``maxTokens > 0`` and server mode is active.
+	tokenSplit: string;
 }
 
 const DEFAULT_SETTINGS: PageWikiSettings = {
@@ -68,6 +72,7 @@ const DEFAULT_SETTINGS: PageWikiSettings = {
 	reuseContext: false,
 	serverUrl: "",
 	useWebSocket: false,
+	tokenSplit: "",
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,10 +126,20 @@ interface WSCallbacks {
  * resolves when the server finishes streaming (either with an
  * ``answer``, ``cancelled``, or ``error`` frame).
  */
+interface AskOptions {
+	decompose: boolean;
+	// v0.15 extensions — all optional so older plugin versions keep
+	// working against a v0.12 server.
+	maxTokens?: number;
+	tokenSplit?: string;
+	jsonMode?: boolean;
+	reuseContext?: boolean;
+}
+
 function connectAskWS(
 	wsUrl: string,
 	query: string,
-	decompose: boolean,
+	opts: AskOptions,
 	callbacks: WSCallbacks,
 ): { cancel: () => void; finished: Promise<void> } {
 	const ws = new WebSocket(wsUrl);
@@ -137,7 +152,20 @@ function connectAskWS(
 	});
 
 	ws.addEventListener("open", () => {
-		ws.send(JSON.stringify({ type: "ask", query, decompose }));
+		const askFrame: Record<string, unknown> = {
+			type: "ask",
+			query,
+			decompose: opts.decompose,
+		};
+		if (opts.maxTokens && opts.maxTokens > 0) {
+			askFrame.max_tokens = opts.maxTokens;
+		}
+		if (opts.tokenSplit && opts.tokenSplit.trim()) {
+			askFrame.token_split = opts.tokenSplit.trim();
+		}
+		if (opts.jsonMode) askFrame.json_mode = true;
+		if (opts.reuseContext) askFrame.reuse_context = true;
+		ws.send(JSON.stringify(askFrame));
 	});
 
 	ws.addEventListener("message", (ev: MessageEvent) => {
@@ -645,7 +673,13 @@ class ChatModal extends Modal {
 			const handle = connectAskWS(
 				wsUrl,
 				contextQuery,
-				this.settings.decomposeByDefault,
+				{
+					decompose: this.settings.decomposeByDefault,
+					maxTokens: this.settings.maxTokens,
+					tokenSplit: this.settings.tokenSplit,
+					jsonMode: this.settings.jsonMode,
+					reuseContext: this.settings.reuseContext,
+				},
 				{
 					onTrace: (data) => {
 						if (bodySpan) {
@@ -969,6 +1003,23 @@ class PageWikiSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.useWebSocket)
 					.onChange(async (value) => {
 						this.plugin.settings.useWebSocket = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Token split (WebSocket mode)")
+			.setDesc(
+				"Per-phase token budget split — SUMMARIZE:RETRIEVE:SYNTH, " +
+				"e.g. '20:60:20'. Only applied when Max tokens > 0 AND " +
+				"WebSocket mode is active. Leave blank to use the flat cap (v0.15).",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("20:60:20")
+					.setValue(this.plugin.settings.tokenSplit)
+					.onChange(async (value) => {
+						this.plugin.settings.tokenSplit = value;
 						await this.plugin.saveSettings();
 					}),
 			);

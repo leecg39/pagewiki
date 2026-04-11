@@ -48,6 +48,11 @@ class UsageEvent:
     prompt_tokens: int
     completion_tokens: int
     elapsed_seconds: float
+    # v0.15: True when the call was dispatched through the
+    # prompt-cacheable path (stable system prefix + user-only
+    # prompt). Used to compute cacheable-call ratios in
+    # ``UsageTracker.cacheable_ratio()``.
+    cacheable: bool = False
 
 
 @dataclass
@@ -63,6 +68,8 @@ class UsageTracker:
         prompt_tokens: int,
         completion_tokens: int,
         elapsed_seconds: float,
+        *,
+        cacheable: bool = False,
     ) -> None:
         with self._lock:
             self.events.append(
@@ -71,6 +78,7 @@ class UsageTracker:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     elapsed_seconds=elapsed_seconds,
+                    cacheable=cacheable,
                 )
             )
 
@@ -97,6 +105,29 @@ class UsageTracker:
     def total_elapsed(self) -> float:
         with self._lock:
             return sum(e.elapsed_seconds for e in self.events)
+
+    @property
+    def cacheable_calls(self) -> int:
+        """v0.15: count of calls that went through the prompt-cache path."""
+        with self._lock:
+            return sum(1 for e in self.events if e.cacheable)
+
+    def cacheable_ratio(self) -> float:
+        """Return the cacheable-call ratio (0.0 to 1.0).
+
+        A call is "cacheable" when it was dispatched with a stable
+        system prefix + user-only prompt, which is the shape Ollama's
+        KV cache can reuse. This is a proxy for actual cache hit rate
+        — the kernel-level hit rate is only visible inside Ollama
+        itself — but it tells you what fraction of your workload is
+        eligible for that optimization.
+        """
+        with self._lock:
+            total = len(self.events)
+            if total == 0:
+                return 0.0
+            hit = sum(1 for e in self.events if e.cacheable)
+            return hit / total
 
     def by_phase(self) -> dict[str, dict[str, int | float]]:
         """Return a per-phase breakdown suitable for tabular display."""

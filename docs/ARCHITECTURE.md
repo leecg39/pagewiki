@@ -222,7 +222,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.11 | /chat/stream + usage 이벤트 + per-vault 캐시 + usage-report CLI — 아래 §7.6 상세 |
 | v0.12 | WebSocket + daily 롤업 + cross-vault + 플러그인 server-mode — 아래 §7.7 상세 |
 | v0.13 | 폴리싱 + 리팩토링 — chat flags, real tokens, plugin Cancel, cross-vault×decompose, CSV/JSON, retrieval split — 아래 §7.8 상세 |
-| **v0.14** (현재) | **DB 정리 + `/usage/history` + Web UI + 예산 분배 + 프롬프트 캐싱** — 아래 §7.9 상세 |
+| v0.14 | DB 정리 + `/usage/history` + Web UI + 예산 분배 + 프롬프트 캐싱 — 아래 §7.9 상세 |
+| **v0.15** (현재) | **Cross-vault parallel + cache hit rate + history stream + WS ext + sparkline** — 아래 §7.10 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -323,13 +324,23 @@ DELETE /chat/{sid}      # 세션 삭제
 | Budget split 정책 | cli.py `_parse_token_split`, vault.py `summarize_atomic_notes(max_tokens=...)` | `--token-split A:B:C` 로 `--max-tokens`를 summarize/retrieve/synthesis 3단계에 비례 분배. summarize는 soft cap (넘으면 남은 노트 건너뛰고 제목만 사용), retrieve는 기존 hard cap 재사용. 비율은 정규화되므로 `20:60:20`과 `1:3:1`이 동일. |
 | Prompt caching | prompts.py `SELECT_NODE_SYSTEM` 등 + `*_user_prompt`, retrieval/core.py `system_chat_fn` | Select/Evaluate/Final 프롬프트를 `(system, user)` 쌍으로 분리. CLI `--prompt-cache` 활성 시 `ollama_client.chat(user, system=SELECT_NODE_SYSTEM)` 으로 호출해 Ollama가 stable prefix의 KV cache를 재사용. history-aware final 답변과 JSON-mode는 기존 concat 경로 유지 (내용이 call 마다 달라서 캐싱 효과 없음). |
 
-### 7.10 v0.15+ 향후 계획
+### 7.10 v0.15 상세
 
-- Plugin WebSocket mode에서 `--token-split` 노출
-- `/usage/history` 에 SSE streaming (long polling 대안)
-- Web UI에 usage chart (간단한 sparkline)
-- Prompt cache 히트율 측정/로깅
-- 멀티 vault에서 cross-vault retrieval 병렬 실행 (현재는 순차)
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| Cross-vault 병렬 실행 | retrieval/cross_vault.py | `run_cross_vault_retrieval(parallel_workers=N)` 시 `ThreadPoolExecutor`로 각 vault를 동시에 retrieval. 인덱스 보존 정렬로 `cited_nodes` 프리픽스 순서 유지. CLI `ask --per-vault`는 자동으로 `--max-workers` 값 사용. |
+| Prompt cache 히트율 | usage.py `UsageEvent.cacheable`, `UsageTracker.cacheable_ratio()` | `_make_system_chat_fn` 경로 호출 시 `tracker.record(..., cacheable=True)`. `cacheable_ratio()`는 전체 LLM 호출 중 cacheable 경로로 디스패치된 비율. `ask --usage`가 "Prompt-cache eligible: N/M (X%)" 라인으로 출력. |
+| `/usage/history/stream` | server.py `usage_history_stream` | SSE 엔드포인트. 연결 시 `initial` 프레임에 최근 N개 이벤트 스냅샷, 이후 `poll_interval`마다 store 폴링해서 새 이벤트만 `event` 프레임으로 송출. idle 시 `heartbeat`. `max_events` / `max_duration` 양쪽 종료 조건. |
+| Plugin WebSocket 확장 | obsidian-plugin/main.ts `connectAskWS(opts)`, server.py `/ask/ws` | `ask` 프레임에 `max_tokens`/`token_split`/`json_mode`/`reuse_context` 수용. 서버는 token_split 비율을 파싱해 retrieve+synth 합산을 `run_retrieval(max_tokens=...)`에 적용. 플러그인 Settings에 `tokenSplit` 텍스트 필드 추가. |
+| Web UI sparkline | webui.py `_HTML_TEMPLATE` | SVG `<polyline>` 기반 인라인 스파크라인. `usage` SSE 이벤트마다 `usageSeries` 에 누적 → `renderSparkline()` 호출. 외부 차트 라이브러리 없음, 40×200px. |
+
+### 7.11 v0.16+ 향후 계획
+
+- Parallel summarize 도중 token budget 체크 주기 개선 (현재는 한 노트 단위)
+- Prompt cache 실제 hit 레이턴시 측정 (Ollama API 확장 시)
+- Web UI에서 `/usage/history/stream` 구독 (historical 뷰)
+- 플러그인 WebSocket에서 prompt-cache 토글 노출
+- `run_cross_vault_retrieval` 에 부분 실패 허용 옵션 (한 vault가 실패해도 나머지 결과로 합성)
 
 ## 8. 명시적 비목표 (Non-Goals)
 
