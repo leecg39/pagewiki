@@ -194,7 +194,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.16.0")
+    app = FastAPI(title="pagewiki API", version="0.17.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -250,6 +250,13 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         persistent_total_calls: int | None = None
         persistent_total_prompt: int | None = None
         persistent_total_completion: int | None = None
+        # v0.17: prompt-cache stats surfaced via /usage.
+        cacheable_calls: int = 0
+        cacheable_ratio: float = 0.0
+        cache_inferred_hit_rate: float = 0.0
+        cache_savings_per_call_seconds: float = 0.0
+        cache_first_call_seconds: float = 0.0
+        cache_subsequent_mean_seconds: float = 0.0
 
     class UsageEventOut(BaseModel):
         timestamp: float
@@ -328,7 +335,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.16.0",
+            "version": "0.17.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -404,6 +411,10 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         When the server was started with ``--usage-db PATH``,
         ``persistent_total_*`` fields are also populated from the
         SQLite store covering the entire store lifetime (v0.10).
+
+        v0.17: Prompt-cache stats (cacheable_calls/ratio + inferred
+        latency savings) are always included; they're 0 when no
+        cacheable calls have happened yet.
         """
         t = state.tracker
 
@@ -415,6 +426,8 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             persistent_calls = summary.total_calls
             persistent_prompt = summary.total_prompt
             persistent_completion = summary.total_completion
+
+        savings = t.cacheable_latency_savings()
 
         return UsageResponse(
             total_calls=t.total_calls,
@@ -434,6 +447,12 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             persistent_total_calls=persistent_calls,
             persistent_total_prompt=persistent_prompt,
             persistent_total_completion=persistent_completion,
+            cacheable_calls=t.cacheable_calls,
+            cacheable_ratio=t.cacheable_ratio(),
+            cache_inferred_hit_rate=float(savings["inferred_hit_rate"]),
+            cache_savings_per_call_seconds=float(savings["savings_per_call_seconds"]),
+            cache_first_call_seconds=float(savings["first_call_seconds"]),
+            cache_subsequent_mean_seconds=float(savings["subsequent_mean_seconds"]),
         )
 
     @app.post("/usage/reset")
@@ -1010,7 +1029,22 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                         system_chat_fn=active_system_chat_fn,
                     )
                 if stop_event.is_set():
-                    event_queue.put(("cancelled", {}))
+                    # v0.17: emit cancel cleanup metadata so clients
+                    # can render a useful "retry" affordance.
+                    event_queue.put(
+                        (
+                            "cancelled",
+                            {
+                                "reason": "client_requested",
+                                "retry_after_ms": 500,
+                                "partial_usage": {
+                                    "calls": local_tracker.total_calls,
+                                    "prompt_tokens": local_tracker.total_prompt_tokens,
+                                    "completion_tokens": local_tracker.total_completion_tokens,
+                                },
+                            },
+                        )
+                    )
                 else:
                     event_queue.put(
                         (

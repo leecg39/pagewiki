@@ -49,6 +49,7 @@ def run_cross_vault_retrieval(
     system_chat_fn: SystemChatFn | None = None,
     parallel_workers: int = 1,
     allow_partial: bool = False,
+    retry_failed: int = 0,
 ) -> RetrievalResult:
     """Run a retrieval loop independently per vault, then synthesize (v0.12).
 
@@ -163,6 +164,35 @@ def run_cross_vault_retrieval(
             _run_one(i, vr, lbl, lidx)
             for i, (vr, lbl, lidx) in indexed_inputs
         ]
+
+    # v0.17: retry failed vaults up to ``retry_failed`` times. Only
+    # meaningful when allow_partial=True (otherwise _run_one would
+    # have propagated the first failure). We rebuild a failed list
+    # from ``raw``, re-run those vaults sequentially (stable order
+    # beats parallelism on error paths), and stitch the new results
+    # back into the same slots.
+    for _attempt in range(retry_failed):
+        still_failed = [(i, label, exc) for i, label, sub, exc in raw if sub is None]
+        if not still_failed:
+            break
+        if on_event is not None:
+            on_event(
+                TraceStep(
+                    "cross-vault",
+                    None,
+                    f"retry {_attempt + 1}/{retry_failed}: "
+                    + ", ".join(lbl for _, lbl, _ in still_failed),
+                )
+            )
+        for i, label, _prev_exc in still_failed:
+            vr = vault_roots[i]
+            lidx = indexes[i]
+            new_entry = _run_one(i, vr, label, lidx)
+            # Replace the failed slot with the retry outcome.
+            raw = [
+                new_entry if existing[0] == i else existing
+                for existing in raw
+            ]
 
     # Re-sort by the original index so per-vault outputs stay ordered.
     raw.sort(key=lambda t: t[0])

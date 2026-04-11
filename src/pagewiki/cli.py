@@ -851,6 +851,13 @@ def watch(
     is_flag=True,
     help="With --per-vault, keep going when a vault fails and synthesize from the rest (v0.16).",
 )
+@click.option(
+    "--retry-failed",
+    "retry_failed",
+    default=0,
+    type=int,
+    help="With --per-vault --allow-partial, retry failed vaults N times (v0.17).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -873,6 +880,7 @@ def ask(
     token_split: str | None,
     prompt_cache: bool,
     allow_partial: bool,
+    retry_failed: int,
 ) -> None:
     """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
@@ -1091,6 +1099,7 @@ def ask(
             system_chat_fn=system_chat_fn,
             parallel_workers=max_workers,  # v0.15 parallel fan-out
             allow_partial=allow_partial,  # v0.16 partial failure tolerance
+            retry_failed=retry_failed,  # v0.17 retry count for failed vaults
         )
     elif decompose:
         result = run_decomposed_retrieval(
@@ -1533,6 +1542,20 @@ def chat(
     is_flag=True,
     help="Attach a prompt-cache chat_fn so WS clients can opt in per-request (v0.16).",
 )
+@click.option(
+    "--retention-days",
+    "retention_days",
+    default=None,
+    type=int,
+    help="Periodically prune usage events older than N days (v0.17). Requires --usage-db.",
+)
+@click.option(
+    "--retention-interval",
+    "retention_interval",
+    default=3600,
+    type=int,
+    help="Seconds between retention passes. Default: 3600 (1 hour).",
+)
 def serve(
     vault: Path | None,
     extra_vaults: tuple[Path, ...],
@@ -1544,6 +1567,8 @@ def serve(
     port: int,
     usage_db: Path | None,
     enable_prompt_cache: bool,
+    retention_days: int | None,
+    retention_interval: int,
 ) -> None:
     """Run pagewiki as an HTTP API server (v0.7).
 
@@ -1628,6 +1653,40 @@ def serve(
 
     note_count = sum(1 for n in state.root.walk() if n.kind == "note")
     console.print(f"[dim]Ready! {note_count} notes loaded. Press Ctrl+C to stop.[/]")
+
+    # v0.17: optional background retention thread. Validates flags
+    # and quietly no-ops when requirements aren't met (e.g. no
+    # --usage-db) so misconfiguration doesn't kill the server.
+    if retention_days is not None and retention_days > 0:
+        if usage_store is None:
+            console.print(
+                "[yellow]--retention-days set but no --usage-db; "
+                "retention disabled.[/]"
+            )
+        else:
+            import threading as _threading
+
+            def _retention_loop() -> None:
+                import time as _time
+                while True:
+                    try:
+                        deleted = usage_store.prune_older_than_days(retention_days)
+                        if deleted > 0:
+                            console.print(
+                                f"[dim][retention] pruned {deleted:,} events "
+                                f"older than {retention_days}d[/]"
+                            )
+                    except Exception as e:  # pragma: no cover
+                        console.print(f"[yellow][retention] error: {e}[/]")
+                    _time.sleep(retention_interval)
+
+            _threading.Thread(
+                target=_retention_loop, name="usage-retention", daemon=True,
+            ).start()
+            console.print(
+                f"[dim]Retention: prune >{retention_days}d every "
+                f"{retention_interval}s[/]"
+            )
 
     app = create_app(state)
     uvicorn.run(app, host=host, port=port, log_level="info")
