@@ -205,7 +205,8 @@ pagewiki ask "query" --vault "~/Documents/Obsidian Vault" --model ollama/gemma4:
 - v0.12: WebSocket `/ask/ws` (양방향, cancel 지원), daily usage 롤업 (`usage-report --daily`), cross-vault retrieval (`--per-vault`), Obsidian 플러그인 server-mode (SSE 직접 소비)
 - v0.13: chat에도 `--json-mode`/`--reuse-context` 노출, SSE usage 이벤트가 실제 LiteLLM 토큰 카운트 사용, 플러그인 WebSocket + Cancel 버튼, cross-vault × decompose 조합, `usage-report --format csv/json`, `retrieval.py` → `retrieval/` 서브패키지 분할
 - v0.14: Usage DB rolling retention (`--prune-older-than`), `GET /usage/history` 엔드포인트, embedded Web UI (`GET /`), 3-phase 토큰 예산 분배 (`--token-split`), Ollama KV-cache 프롬프트 재사용 (`--prompt-cache`)
-- **v0.15 (현재)**: Cross-vault retrieval 병렬 실행, Prompt cache 히트율 측정, `GET /usage/history/stream` SSE tail, 플러그인 WebSocket이 token_split/max_tokens/json_mode/reuse_context 전송, Web UI sparkline 차트
+- v0.15: Cross-vault retrieval 병렬 실행, Prompt cache 히트율 측정, `GET /usage/history/stream` SSE tail, 플러그인 WebSocket이 token_split/max_tokens/json_mode/reuse_context 전송, Web UI sparkline 차트
+- **v0.16 (현재)**: 병렬 summarize에 per-wave 예산 체크, prompt-cache 추론 레이턴시 savings, Web UI historical view, 플러그인 `--prompt-cache` 토글, cross-vault `--allow-partial`
 
 ## Obsidian 플러그인 (v0.6)
 

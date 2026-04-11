@@ -129,6 +129,59 @@ class UsageTracker:
             hit = sum(1 for e in self.events if e.cacheable)
             return hit / total
 
+    def cacheable_latency_savings(self) -> dict[str, float]:
+        """Measure inferred prompt-cache speedup (v0.16).
+
+        Ollama doesn't expose actual KV-cache hit/miss via LiteLLM, so
+        we estimate the benefit from the outside: for each phase that
+        has at least 2 cacheable calls, compare the **first** cacheable
+        call's latency (a cache-miss proxy — the cold path) against
+        the **mean** of the rest (cache-hit proxies). A negative number
+        means the rest were slower than the first; a positive number
+        means caching is likely helping.
+
+        Returns::
+
+            {
+                "first_call_seconds": <float>,
+                "subsequent_mean_seconds": <float>,
+                "savings_per_call_seconds": <float>,
+                "inferred_hit_rate": <float 0.0-1.0>,
+                "samples": <int>,
+            }
+
+        ``inferred_hit_rate`` is ``savings / first_call`` clamped to
+        [0, 1] — a very rough proxy that's ``1.0`` when subsequent
+        calls are effectively instant and ``0.0`` when they're
+        equally slow (no cache benefit).
+        """
+        with self._lock:
+            cacheable_events = [e for e in self.events if e.cacheable]
+        if len(cacheable_events) < 2:
+            return {
+                "first_call_seconds": 0.0,
+                "subsequent_mean_seconds": 0.0,
+                "savings_per_call_seconds": 0.0,
+                "inferred_hit_rate": 0.0,
+                "samples": len(cacheable_events),
+            }
+
+        first = cacheable_events[0]
+        rest = cacheable_events[1:]
+        rest_mean = sum(e.elapsed_seconds for e in rest) / len(rest)
+        savings = first.elapsed_seconds - rest_mean
+        if first.elapsed_seconds > 0:
+            hit_rate = max(0.0, min(1.0, savings / first.elapsed_seconds))
+        else:
+            hit_rate = 0.0
+        return {
+            "first_call_seconds": first.elapsed_seconds,
+            "subsequent_mean_seconds": rest_mean,
+            "savings_per_call_seconds": savings,
+            "inferred_hit_rate": hit_rate,
+            "samples": len(cacheable_events),
+        }
+
     def by_phase(self) -> dict[str, dict[str, int | float]]:
         """Return a per-phase breakdown suitable for tabular display."""
         buckets: dict[str, dict[str, float]] = defaultdict(

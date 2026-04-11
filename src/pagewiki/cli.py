@@ -845,6 +845,12 @@ def watch(
     is_flag=True,
     help="Send stable system prefixes separately for Ollama KV-cache reuse (v0.14).",
 )
+@click.option(
+    "--allow-partial",
+    "allow_partial",
+    is_flag=True,
+    help="With --per-vault, keep going when a vault fails and synthesize from the rest (v0.16).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -866,6 +872,7 @@ def ask(
     per_vault: bool,
     token_split: str | None,
     prompt_cache: bool,
+    allow_partial: bool,
 ) -> None:
     """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
@@ -1083,6 +1090,7 @@ def ask(
             decompose=decompose,  # v0.13 cross-vault × decompose
             system_chat_fn=system_chat_fn,
             parallel_workers=max_workers,  # v0.15 parallel fan-out
+            allow_partial=allow_partial,  # v0.16 partial failure tolerance
         )
     elif decompose:
         result = run_decomposed_retrieval(
@@ -1155,6 +1163,18 @@ def ask(
                 f"[dim]Prompt-cache eligible: "
                 f"{cacheable_calls}/{tracker.total_calls} calls "
                 f"({cacheable_ratio:.1%})[/]"
+            )
+
+        # v0.16: inferred latency savings from cache reuse. Only
+        # print when there are at least 2 cacheable calls so the
+        # first-vs-rest comparison is meaningful.
+        savings_info = tracker.cacheable_latency_savings()
+        if savings_info["samples"] >= 2:
+            console.print(
+                f"[dim]  first={savings_info['first_call_seconds']:.2f}s, "
+                f"subsequent_mean={savings_info['subsequent_mean_seconds']:.2f}s, "
+                f"savings={savings_info['savings_per_call_seconds']:+.2f}s/call, "
+                f"inferred_hit_rate={savings_info['inferred_hit_rate']:.1%}[/]"
             )
 
     record = QueryRecord(
@@ -1507,6 +1527,12 @@ def chat(
     type=click.Path(dir_okay=False, path_type=Path),
     help="Optional SQLite path for persistent usage tracking (v0.10).",
 )
+@click.option(
+    "--prompt-cache",
+    "enable_prompt_cache",
+    is_flag=True,
+    help="Attach a prompt-cache chat_fn so WS clients can opt in per-request (v0.16).",
+)
 def serve(
     vault: Path | None,
     extra_vaults: tuple[Path, ...],
@@ -1517,6 +1543,7 @@ def serve(
     host: str,
     port: int,
     usage_db: Path | None,
+    enable_prompt_cache: bool,
 ) -> None:
     """Run pagewiki as an HTTP API server (v0.7).
 
@@ -1572,6 +1599,15 @@ def serve(
         model, num_ctx, tracker=tracker, usage_store=usage_store,
     )
 
+    # v0.16: optionally build a system-split chat_fn so WebSocket
+    # clients can request prompt-cache mode on a per-query basis.
+    system_chat_fn = None
+    if enable_prompt_cache:
+        system_chat_fn = _make_system_chat_fn(
+            model, num_ctx, tracker=tracker, usage_store=usage_store,
+        )
+        console.print("[dim]Prompt cache: enabled (clients can opt in per-request)[/]")
+
     try:
         state = build_initial_state(
             all_vaults,
@@ -1585,9 +1621,10 @@ def serve(
         console.print(f"[red]Failed to build initial state: {e}[/]")
         sys.exit(1)
 
-    # Attach the same tracker + store to state so HTTP handlers can read them.
+    # Attach the same tracker + store + optional system_chat_fn to state.
     state.tracker = tracker
     state.usage_store = usage_store
+    state.system_chat_fn = system_chat_fn
 
     note_count = sum(1 for n in state.root.walk() if n.kind == "note")
     console.print(f"[dim]Ready! {note_count} notes loaded. Press Ctrl+C to stop.[/]")
