@@ -189,7 +189,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.14.0")
+    app = FastAPI(title="pagewiki API", version="0.15.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -323,7 +323,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.14.0",
+            "version": "0.15.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -554,6 +554,112 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             summary=summary_resp,
             events=event_out,
             daily=daily_out,
+        )
+
+    @app.get("/usage/history/stream")
+    def usage_history_stream(
+        poll_interval: float = 2.0,
+        initial_limit: int = 20,
+        max_events: int = 0,
+        max_duration: float = 900.0,
+    ):
+        """Stream usage events as SSE frames (v0.15).
+
+        On connect, emits an ``initial`` frame with the N most recent
+        events, then polls the ``usage_events`` table every
+        ``poll_interval`` seconds and emits an ``event`` frame for
+        each newly-appended row. Plus a ``heartbeat`` every poll
+        cycle so the client sees life signals even on an idle store.
+
+        Query parameters:
+          * ``poll_interval``  — seconds between polls (default 2.0)
+          * ``initial_limit``  — how many recent events to backfill (default 20)
+          * ``max_events``     — stop after N new events (0 = unlimited)
+          * ``max_duration``   — hard cap on total stream seconds (default 900)
+
+        Returns ``503`` when ``--usage-db`` isn't set.
+        """
+        if state.usage_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Usage persistence is not enabled.",
+            )
+
+        import json as _json
+
+        store = state.usage_store
+
+        # Capture the current tip so we only stream NEW events.
+        initial_events = store.query_events(limit=initial_limit)
+
+        def _event_payload(e) -> dict:
+            return {
+                "timestamp": e.timestamp,
+                "phase": e.phase,
+                "prompt": e.prompt,
+                "completion": e.completion,
+                "elapsed": e.elapsed,
+            }
+
+        last_seen_ts = (
+            initial_events[0].timestamp if initial_events else 0.0
+        )
+
+        def event_stream():
+            nonlocal last_seen_ts
+            # 1. Initial snapshot.
+            snapshot = [
+                _event_payload(e) for e in reversed(initial_events)
+            ]
+            yield "event: initial\n"
+            yield (
+                f"data: {_json.dumps({'events': snapshot}, ensure_ascii=False)}\n\n"
+            )
+
+            import time as _time
+
+            emitted = 0
+            # Cap the loop at ``max_duration`` seconds so idle
+            # clients don't hold the worker forever. Clients who
+            # want a longer subscription should reconnect.
+            start = _time.time()
+            while _time.time() - start < max_duration:
+                _time.sleep(max(0.1, poll_interval))
+                fresh = store.query_events(limit=500)
+                # Keep only events strictly newer than what we've
+                # already shipped. Ordering returned by
+                # query_events is "most-recent first", so reverse
+                # for a stable stream order.
+                new_rows = [e for e in fresh if e.timestamp > last_seen_ts]
+                if new_rows:
+                    for e in reversed(new_rows):
+                        payload = _event_payload(e)
+                        yield "event: event\n"
+                        yield (
+                            f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n"
+                        )
+                        emitted += 1
+                        last_seen_ts = max(last_seen_ts, e.timestamp)
+                        if max_events and emitted >= max_events:
+                            yield "event: done\n"
+                            yield "data: {}\n\n"
+                            return
+                else:
+                    yield "event: heartbeat\n"
+                    yield (
+                        f"data: {_json.dumps({'last_seen': last_seen_ts})}\n\n"
+                    )
+            yield "event: done\n"
+            yield "data: {}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     # ── v0.10/v0.11 SSE streaming endpoints ───────────────────────────────
@@ -857,13 +963,24 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                 )
             )
 
-        def run_query(query: str, decompose: bool) -> None:
+        def run_query(
+            query: str,
+            *,
+            decompose: bool,
+            max_tokens: int | None,
+            json_mode: bool,
+            reuse_context: bool,
+        ) -> None:
             try:
                 if decompose:
                     result = run_decomposed_retrieval(
                         query, state.root, tracked_chat_fn,
                         link_index=state.link_index,
                         on_event=on_event,
+                        max_tokens=max_tokens,
+                        tracker=local_tracker,
+                        json_mode=json_mode,
+                        reuse_context=reuse_context,
                     )
                 else:
                     result = run_retrieval(
@@ -871,6 +988,10 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                         link_index=state.link_index,
                         on_event=on_event,
                         should_stop=stop_event.is_set,
+                        max_tokens=max_tokens,
+                        tracker=local_tracker,
+                        json_mode=json_mode,
+                        reuse_context=reuse_context,
                     )
                 if stop_event.is_set():
                     event_queue.put(("cancelled", {}))
@@ -953,9 +1074,36 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                         except _queue.Empty:
                             break
 
+                    # v0.15: accept token_split / max_tokens /
+                    # json_mode / reuse_context from the ask frame.
+                    parsed_max_tokens = msg.get("max_tokens")
+                    token_split_spec = msg.get("token_split")
+                    if token_split_spec and parsed_max_tokens:
+                        # Client-side split is: A:B:C ratios. Apply
+                        # the same parse logic as the CLI. Only the
+                        # retrieve+synth portion matters for the
+                        # run_retrieval call.
+                        parts = str(token_split_spec).split(":")
+                        try:
+                            ratios = [float(p) for p in parts]
+                            if len(ratios) == 3 and sum(ratios) > 0:
+                                s = sum(ratios)
+                                retrieve_cap = int(
+                                    parsed_max_tokens * (ratios[1] + ratios[2]) / s
+                                )
+                                parsed_max_tokens = max(1, retrieve_cap)
+                        except ValueError:
+                            pass  # fall through with original max_tokens
+
                     current_worker = _threading.Thread(
                         target=run_query,
-                        args=(query, bool(msg.get("decompose", False))),
+                        args=(query,),
+                        kwargs={
+                            "decompose": bool(msg.get("decompose", False)),
+                            "max_tokens": parsed_max_tokens,
+                            "json_mode": bool(msg.get("json_mode", False)),
+                            "reuse_context": bool(msg.get("reuse_context", False)),
+                        },
                         daemon=True,
                     )
                     current_worker.start()

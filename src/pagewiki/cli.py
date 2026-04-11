@@ -78,6 +78,10 @@ def _make_system_chat_fn(model: str, num_ctx: int, tracker=None, usage_store=Non
     KV cache for the stable prefix and only incrementally process
     the user message. Tracker/store integration mirrors
     ``_make_chat_fn``.
+
+    v0.15: tracker records ``cacheable=True`` for these calls so
+    ``UsageTracker.cacheable_ratio()`` can report the fraction of
+    the workload eligible for Ollama's KV-cache reuse.
     """
     import time as _time
 
@@ -90,7 +94,10 @@ def _make_system_chat_fn(model: str, num_ctx: int, tracker=None, usage_store=Non
         prompt_tokens = response.prompt_tokens or 0
         completion_tokens = response.completion_tokens or 0
         if tracker is not None:
-            tracker.record("other", prompt_tokens, completion_tokens, elapsed)
+            tracker.record(
+                "other", prompt_tokens, completion_tokens, elapsed,
+                cacheable=True,
+            )
         if usage_store is not None:
             usage_store.record("other", prompt_tokens, completion_tokens, elapsed)
         return response.text
@@ -1074,6 +1081,8 @@ def ask(
             max_tokens=effective_retrieve_cap, tracker=tracker,
             json_mode=json_mode, reuse_context=reuse_context,
             decompose=decompose,  # v0.13 cross-vault × decompose
+            system_chat_fn=system_chat_fn,
+            parallel_workers=max_workers,  # v0.15 parallel fan-out
         )
     elif decompose:
         result = run_decomposed_retrieval(
@@ -1135,6 +1144,18 @@ def ask(
         )
         console.print()
         console.print(usage_table)
+
+        # v0.15: prompt-cache hit rate proxy. Only meaningful when
+        # --prompt-cache is active; we still print it at 0% so
+        # users can see the flag had no effect when misconfigured.
+        cacheable_ratio = tracker.cacheable_ratio()
+        cacheable_calls = tracker.cacheable_calls
+        if tracker.total_calls > 0:
+            console.print(
+                f"[dim]Prompt-cache eligible: "
+                f"{cacheable_calls}/{tracker.total_calls} calls "
+                f"({cacheable_ratio:.1%})[/]"
+            )
 
     record = QueryRecord(
         query=query,

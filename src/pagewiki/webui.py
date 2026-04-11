@@ -104,6 +104,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
   }
   .cited { color: var(--muted); font-size: 12px; }
   .cited code { background: var(--bg); padding: 1px 6px; border-radius: 3px; }
+  .sparkline-card {
+    display: flex; align-items: center; gap: 16px;
+  }
+  .sparkline-card svg { display: block; }
+  .sparkline-card .labels {
+    display: flex; flex-direction: column; gap: 4px;
+    font-size: 11px; color: var(--muted);
+  }
+  .sparkline-card .labels strong { color: var(--fg); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -145,6 +154,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <div class="answer" id="answer">(ask a question to get started)</div>
     <div id="cited" class="cited" style="margin-top: 12px;"></div>
   </div>
+
+  <div class="card sparkline-card">
+    <svg id="sparkline" width="200" height="40" viewBox="0 0 200 40"
+         preserveAspectRatio="none">
+      <polyline id="sparkline-path" fill="none" stroke="#7aa2f7" stroke-width="1.5"
+                points=""/>
+      <circle id="sparkline-dot" cx="0" cy="0" r="2" fill="#7aa2f7"
+              style="display:none"/>
+    </svg>
+    <div class="labels">
+      <strong id="spark-total">0</strong>
+      <span>tokens this query</span>
+      <span id="spark-points" style="font-size: 10px;">0 calls</span>
+    </div>
+  </div>
 </main>
 
 <script>
@@ -160,8 +184,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
   const citedEl = document.getElementById("cited");
   const statusEl = document.getElementById("status");
   const tokensEl = document.getElementById("tokens");
+  const sparklinePath = document.getElementById("sparkline-path");
+  const sparkTotal = document.getElementById("spark-total");
+  const sparkPoints = document.getElementById("spark-points");
 
   let abortController = null;
+  let usageSeries = [];  // cumulative token counts per usage event
 
   askBtn.addEventListener("click", runQuery);
   cancelBtn.addEventListener("click", () => {
@@ -186,6 +214,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
     citedEl.textContent = "";
     statusEl.textContent = "streaming";
     tokensEl.textContent = "0 tokens";
+    usageSeries = [];
+    renderSparkline();
     askBtn.disabled = true;
     cancelBtn.disabled = false;
 
@@ -265,6 +295,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
       traceEl.scrollTop = traceEl.scrollHeight;
     } else if (eventName === "usage") {
       tokensEl.textContent = (data.total_tokens || 0) + " tokens";
+      usageSeries.push(data.total_tokens || 0);
+      renderSparkline();
     } else if (eventName === "answer") {
       answerEl.textContent = data.answer || "";
       if (Array.isArray(data.cited_nodes) && data.cited_nodes.length) {
@@ -281,6 +313,27 @@ _HTML_TEMPLATE = r"""<!doctype html>
     return String(s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function renderSparkline() {
+    const W = 200, H = 40, pad = 2;
+    const points = usageSeries;
+    if (points.length === 0) {
+      sparklinePath.setAttribute("points", "");
+      sparkTotal.textContent = "0";
+      sparkPoints.textContent = "0 calls";
+      return;
+    }
+    const max = Math.max(...points) || 1;
+    const step = points.length > 1 ? (W - pad * 2) / (points.length - 1) : 0;
+    const coords = points.map((v, i) => {
+      const x = pad + i * step;
+      const y = H - pad - ((v / max) * (H - pad * 2));
+      return x.toFixed(1) + "," + y.toFixed(1);
+    });
+    sparklinePath.setAttribute("points", coords.join(" "));
+    sparkTotal.textContent = String(points[points.length - 1] || 0);
+    sparkPoints.textContent = points.length + " calls";
   }
 })();
 </script>
