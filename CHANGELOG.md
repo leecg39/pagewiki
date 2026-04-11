@@ -4,7 +4,45 @@ All notable changes to pagewiki are tracked here. The project follows
 [Semantic Versioning](https://semver.org/) and targets a stable
 **v1.0.0** release as its first production milestone.
 
-## [1.0.0] — current (stable release)
+## [1.1.0] — current
+
+First additive release on the 1.x line. Every change here is
+backward-compatible; no shipped behavior was removed or changed.
+
+### Added
+- **`pagewiki stats`** command — zero-LLM vault statistics:
+  3-tier distribution, wiki-link graph (resolved/dangling/ambiguous),
+  top-N linked-to, top-N outgoing, frontmatter tag histogram,
+  orphan detection, and folder fan-out.
+- **`pagewiki batch`** command — runs a list of queries from a
+  text file against a single warmed scan. Supports `# comments`,
+  blank lines, `--output` markdown report, `--stop-on-error`.
+- **`GET /metrics`** — Prometheus text-format endpoint exposing
+  `pagewiki_llm_calls_total`, `pagewiki_prompt_tokens_total`,
+  `pagewiki_completion_tokens_total`, `pagewiki_cacheable_calls_total`,
+  `pagewiki_phase_calls_total{phase="..."}`,
+  `pagewiki_note_count`, `pagewiki_active_sessions`,
+  `pagewiki_cacheable_ratio`, `pagewiki_cache_inferred_hit_rate`,
+  and (when `--usage-db` is set) `pagewiki_persistent_*_total`
+  lifetime counters.
+- **`--lang en`** — new CLI flag on `ask`/`chat` that switches
+  retrieval prompts to English. New `pagewiki.prompts_en` module
+  provides `select_node_prompt_en`, `evaluate_prompt_en`,
+  `final_answer_prompt_en`, `atomic_summary_prompt_en`,
+  `decompose_query_prompt_en`, `synthesize_multi_answer_prompt_en`,
+  plus `EN_SELECT_NODE_SYSTEM`/`EN_EVALUATE_SYSTEM`/
+  `EN_FINAL_ANSWER_SYSTEM` constants. Format markers (`SELECT:`,
+  `DONE:`, `SUFFICIENT:`, etc.) are preserved so the existing
+  parsers handle both languages.
+- **`run_retrieval(lang="en")`** — language selection parameter
+  on the public retrieval API. Defaults to `"ko"` to preserve
+  v1.0 behavior.
+
+### Test coverage
+
+- 398 tests pass (17 new in `test_v1_1_features.py`), ruff clean.
+
+## [1.0.0] — stable release
 
 ### Released
 - **Development Status bumped** from `3 - Alpha` to

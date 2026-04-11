@@ -490,6 +490,147 @@ def scan(
 
 
 @main.command()
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root. Auto-discovered if omitted.",
+)
+@click.option(
+    "--folder", default=None, help="Subfolder inside the vault."
+)
+@click.option(
+    "--top",
+    default=10,
+    type=int,
+    help="How many entries to show in top-N lists. Default: 10.",
+)
+def stats(
+    vault: Path | None,
+    folder: str | None,
+    top: int,
+) -> None:
+    """Print vault statistics without invoking the LLM (v1.1).
+
+    Walks the Layer 1 tree and reports:
+      * Tier distribution (MICRO/ATOMIC/LONG counts + tokens)
+      * Wiki-link graph summary (resolved, dangling, ambiguous)
+      * Top-N linked-to notes (hub detection)
+      * Top-N outgoing notes (link producer detection)
+      * Frontmatter tag histogram
+      * Orphan notes (no incoming AND no outgoing links)
+      * Folder fan-out (max / avg notes per folder)
+
+    Pure I/O — no LLM calls, no cache writes. Useful as a cheap
+    pre-flight for ``ask`` or to monitor vault health over time.
+    """
+    from collections import Counter
+
+    vault = _resolve_vault(vault)
+    console.print(f"[bold cyan]Stats[/] {vault}{('/' + folder) if folder else ''}")
+
+    root = scan_folder(vault, folder)
+
+    # Tier distribution.
+    counts = {NoteTier.MICRO: 0, NoteTier.ATOMIC: 0, NoteTier.LONG: 0}
+    tokens_by_tier = {NoteTier.MICRO: 0, NoteTier.ATOMIC: 0, NoteTier.LONG: 0}
+    total_notes = 0
+    all_tags: Counter[str] = Counter()
+    notes_by_folder: dict[str, int] = {}
+
+    for node in root.walk():
+        if node.kind == "note" and node.tier is not None:
+            counts[node.tier] += 1
+            tokens_by_tier[node.tier] += node.token_count or 0
+            total_notes += 1
+            for tag in node.tags:
+                all_tags[tag] += 1
+            parent = str(Path(node.node_id).parent) if node.node_id else "."
+            notes_by_folder[parent] = notes_by_folder.get(parent, 0) + 1
+
+    if total_notes == 0:
+        console.print(f"[red]No notes found in {vault / (folder or '')}[/]")
+        sys.exit(1)
+
+    tier_table = Table(title="3-tier classification")
+    tier_table.add_column("Tier", style="bold")
+    tier_table.add_column("Count", justify="right")
+    tier_table.add_column("Total tokens", justify="right")
+    for tier in (NoteTier.MICRO, NoteTier.ATOMIC, NoteTier.LONG):
+        tier_table.add_row(
+            tier.value.upper(),
+            str(counts[tier]),
+            f"{tokens_by_tier[tier]:,}",
+        )
+    tier_table.add_row(
+        "[bold]TOTAL",
+        f"[bold]{total_notes}",
+        f"[bold]{sum(tokens_by_tier.values()):,}",
+    )
+    console.print(tier_table)
+
+    # Wiki-link graph summary.
+    from .wiki_links import build_link_index
+
+    link_index = build_link_index(root)
+    link_stats = link_index.stats()
+
+    console.print(
+        f"\n[bold]Wiki-link graph:[/] "
+        f"resolved={link_stats.total_links}  "
+        f"dangling={link_stats.dangling_count}  "
+        f"ambiguous={link_stats.ambiguous_links}"
+    )
+
+    # Top linked-to / outgoing.
+    if link_stats.top_linked_to:
+        top_in = Table(title=f"Top {min(top, len(link_stats.top_linked_to))} linked-to")
+        top_in.add_column("Note", style="bold")
+        top_in.add_column("Incoming", justify="right")
+        for title, count in link_stats.top_linked_to[:top]:
+            top_in.add_row(title, str(count))
+        console.print(top_in)
+
+    if link_stats.top_outgoing:
+        top_out = Table(title=f"Top {min(top, len(link_stats.top_outgoing))} outgoing")
+        top_out.add_column("Note", style="bold")
+        top_out.add_column("Outgoing", justify="right")
+        for title, count in link_stats.top_outgoing[:top]:
+            top_out.add_row(title, str(count))
+        console.print(top_out)
+
+    # Frontmatter tag histogram.
+    if all_tags:
+        tag_table = Table(title=f"Top {min(top, len(all_tags))} frontmatter tags")
+        tag_table.add_column("Tag", style="bold")
+        tag_table.add_column("Notes", justify="right")
+        for tag, n in all_tags.most_common(top):
+            tag_table.add_row(f"#{tag}", str(n))
+        console.print(tag_table)
+
+    # Orphan detection.
+    note_ids = {n.node_id for n in root.walk() if n.kind == "note"}
+    orphans = [
+        nid for nid in note_ids
+        if not link_index.backlinks(nid) and not link_index.outgoing(nid)
+    ]
+    console.print(
+        f"\n[bold]Orphans[/] (no incoming, no outgoing links): "
+        f"{len(orphans)} ({len(orphans) / total_notes:.1%} of vault)"
+    )
+
+    # Folder fan-out.
+    if notes_by_folder:
+        max_folder = max(notes_by_folder.items(), key=lambda x: x[1])
+        avg_per_folder = total_notes / len(notes_by_folder)
+        console.print(
+            f"[bold]Folder fan-out:[/] {len(notes_by_folder)} folders, "
+            f"avg {avg_per_folder:.1f} notes/folder, "
+            f"max {max_folder[1]} in [dim]{max_folder[0]}[/]"
+        )
+
+
+@main.command()
 def vaults() -> None:
     """List every Obsidian vault discoverable via notesmd-cli or obsidian.json.
 
@@ -858,6 +999,13 @@ def watch(
     type=int,
     help="With --per-vault --allow-partial, retry failed vaults N times (v0.17).",
 )
+@click.option(
+    "--lang",
+    "lang",
+    default="ko",
+    type=click.Choice(["ko", "en"]),
+    help="Language of retrieval prompts. Default: ko (Korean). 'en' uses English templates (v1.1).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -881,6 +1029,7 @@ def ask(
     prompt_cache: bool,
     allow_partial: bool,
     retry_failed: int,
+    lang: str,
 ) -> None:
     """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
@@ -1115,6 +1264,7 @@ def ask(
             max_tokens=effective_retrieve_cap, tracker=tracker,
             json_mode=json_mode, reuse_context=reuse_context,
             system_chat_fn=system_chat_fn,
+            lang=lang,
         )
 
     elapsed = time.time() - start
@@ -1693,6 +1843,154 @@ def serve(
 
     app = create_app(state)
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+@main.command()
+@click.argument(
+    "queries_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root.",
+)
+@click.option("--folder", default="Research", help="Subfolder inside the vault.")
+@click.option("--model", default="ollama/gemma4:26b", help="LiteLLM model id.")
+@click.option("--num-ctx", default=131072, type=int, help="Ollama context window.")
+@click.option(
+    "--max-workers", default=4, type=int, help="Parallel LLM workers.",
+)
+@click.option(
+    "--output",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Write results to this markdown file (default: stdout only).",
+)
+@click.option(
+    "--stop-on-error",
+    is_flag=True,
+    help="Abort the batch on the first failure (default: continue).",
+)
+def batch(
+    queries_file: Path,
+    vault: Path | None,
+    folder: str,
+    model: str,
+    num_ctx: int,
+    max_workers: int,
+    output: Path | None,
+    stop_on_error: bool,
+) -> None:
+    """Run multiple queries from a text file in sequence (v1.1).
+
+    The file must contain one query per line. Blank lines and lines
+    starting with ``#`` are skipped so you can annotate a batch
+    file with comments.
+
+    Each query shares the same warm scan (summarize + sub-trees),
+    so the amortized cost is much lower than running ``ask`` N
+    times from scratch. Results are printed to stdout as they
+    arrive and optionally appended to a markdown report at
+    ``--output``.
+    """
+    from .wiki_links import build_link_index
+
+    vault = _resolve_vault(vault)
+
+    # Parse the queries file.
+    raw_lines = queries_file.read_text(encoding="utf-8").splitlines()
+    queries = [
+        line.strip()
+        for line in raw_lines
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not queries:
+        console.print(
+            f"[yellow]No queries found in {queries_file}. "
+            "Non-comment, non-blank lines are treated as queries.[/]"
+        )
+        sys.exit(1)
+
+    console.print(
+        f"[bold cyan]Batch[/] {len(queries)} queries from {queries_file}"
+    )
+    console.print(f"  vault={vault}  folder={folder}  model={model}\n")
+
+    chat_fn = _make_chat_fn(model, num_ctx)
+
+    # Warm the tree once.
+    console.print("[dim]Scanning + summarizing...[/]")
+    root = scan_folder(vault, folder)
+    scache = SummaryCache(vault)
+    summarize_atomic_notes(
+        root, chat_fn, summary_cache=scache, model_id=model,
+        max_workers=max_workers,
+    )
+    long_count = sum(
+        1 for n in root.walk() if n.kind == "note" and n.tier == NoteTier.LONG
+    )
+    if long_count > 0:
+        build_long_subtrees(
+            root, vault_root=vault, model_id=model,
+            chat_fn=chat_fn, cache=TreeCache(vault),
+        )
+    link_index = build_link_index(root)
+    console.print(
+        f"[dim]  → ready, "
+        f"{sum(1 for n in root.walk() if n.kind == 'note')} notes loaded[/]\n"
+    )
+
+    # Run each query.
+    results: list[tuple[str, str, list[str], float]] = []
+    for i, query in enumerate(queries, start=1):
+        console.print(f"[bold cyan]Q{i}/{len(queries)}:[/] {query}")
+        t0 = time.time()
+        try:
+            result = run_retrieval(
+                query, root, chat_fn,
+                link_index=link_index,
+            )
+            elapsed = time.time() - t0
+            results.append((query, result.answer, result.cited_nodes, elapsed))
+            console.print(f"[bold green]A{i}:[/] {result.answer}\n")
+        except Exception as e:
+            console.print(f"[red]Query {i} failed: {e}[/]\n")
+            if stop_on_error:
+                sys.exit(1)
+            results.append((query, f"[ERROR] {e}", [], time.time() - t0))
+
+    # Optional markdown output.
+    if output is not None:
+        from datetime import datetime as _dt
+
+        lines = [
+            "# pagewiki batch results",
+            "",
+            f"- **Vault**: `{vault}`  ",
+            f"- **Folder**: `{folder}`  ",
+            f"- **Model**: `{model}`  ",
+            f"- **Timestamp**: {_dt.now().isoformat(timespec='seconds')}  ",
+            f"- **Queries**: {len(results)}",
+            "",
+        ]
+        for i, (query, answer, cited, elapsed) in enumerate(results, start=1):
+            lines.append(f"## Q{i}: {query}")
+            lines.append("")
+            lines.append(answer)
+            lines.append("")
+            if cited:
+                lines.append("**Cited:**")
+                for c in cited:
+                    lines.append(f"- `{c}`")
+                lines.append("")
+            lines.append(f"*elapsed: {elapsed:.1f}s*")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        output.write_text("\n".join(lines), encoding="utf-8")
+        console.print(f"[dim]Batch report written to {output}[/]")
 
 
 @main.command("usage-report")

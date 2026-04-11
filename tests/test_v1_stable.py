@@ -12,23 +12,27 @@ from pathlib import Path
 
 
 class TestVersionAndMetadata:
-    def test_version_is_1_0_0(self) -> None:
+    def test_version_is_1_x(self) -> None:
         import pagewiki
-        assert pagewiki.__version__ == "1.0.0"
+        # 1.x stable line — anything 1.y.z is acceptable.
+        assert pagewiki.__version__.startswith("1.")
 
     def test_pyproject_marks_production_stable(self) -> None:
         text = Path("/home/user/pagewiki/pyproject.toml").read_text()
-        assert 'version = "1.0.0"' in text
+        assert 'version = "1.' in text
         assert "Development Status :: 5 - Production/Stable" in text
 
     def test_plugin_manifest_matches(self) -> None:
         import json
+
+        import pagewiki
         data = json.loads(
             Path("/home/user/pagewiki/obsidian-plugin/manifest.json").read_text()
         )
-        assert data["version"] == "1.0.0"
+        # Plugin manifest stays in lockstep with the Python package.
+        assert data["version"] == pagewiki.__version__
 
-    def test_changelog_has_1_0_0_entry(self) -> None:
+    def test_changelog_has_1_0_entry(self) -> None:
         text = Path("/home/user/pagewiki/CHANGELOG.md").read_text()
         assert "[1.0.0]" in text
 
@@ -192,12 +196,13 @@ class TestCLIStability:
         ):
             assert flag in result.output, f"missing flag on ask: {flag}"
 
-    def test_version_flag_reports_1_0_0(self) -> None:
+    def test_version_flag_reports_1_x(self) -> None:
         from click.testing import CliRunner
 
+        import pagewiki
         from pagewiki.cli import main
 
         runner = CliRunner()
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "1.0.0" in result.output
+        assert pagewiki.__version__ in result.output
