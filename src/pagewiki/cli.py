@@ -962,6 +962,7 @@ def ask(
             on_event=_on_event,
             max_tokens=max_tokens, tracker=tracker,
             json_mode=json_mode, reuse_context=reuse_context,
+            decompose=decompose,  # v0.13 cross-vault × decompose
         )
     elif decompose:
         result = run_decomposed_retrieval(
@@ -1083,6 +1084,18 @@ def ask(
     type=int,
     help="Per-turn token budget. Each chat turn aborts if exceeded (v0.9).",
 )
+@click.option(
+    "--json-mode",
+    "json_mode",
+    is_flag=True,
+    help="Use JSON-schema prompts + parser for SELECT/EVALUATE (v0.10).",
+)
+@click.option(
+    "--reuse-context",
+    "reuse_context",
+    is_flag=True,
+    help="Compact path_so_far + suppress already-shown candidates (v0.10).",
+)
 def chat(
     vault: Path | None,
     extra_vaults: tuple[Path, ...],
@@ -1097,6 +1110,8 @@ def chat(
     decompose: bool,
     usage: bool,
     max_tokens: int | None,
+    json_mode: bool,
+    reuse_context: bool,
 ) -> None:
     """Interactive multi-turn conversation against a vault folder.
 
@@ -1254,12 +1269,14 @@ def chat(
                 effective_query, root, chat_fn,
                 link_index=link_index, on_event=_on_event,
                 max_tokens=turn_max_tokens, tracker=tracker,
+                json_mode=json_mode, reuse_context=reuse_context,
             )
         else:
             result = run_retrieval(
                 effective_query, root, chat_fn,
                 link_index=link_index, on_event=_on_event, history=history,
                 max_tokens=turn_max_tokens, tracker=tracker,
+                json_mode=json_mode, reuse_context=reuse_context,
             )
 
         elapsed = time.time() - start
@@ -1480,6 +1497,13 @@ def serve(
     is_flag=True,
     help="Rollup and print daily aggregates (v0.12).",
 )
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "csv", "json"]),
+    default="table",
+    help="Output format. 'table' (default) uses Rich; csv/json are machine-readable (v0.13).",
+)
 def usage_report(
     db_path: Path,
     since: str | None,
@@ -1487,6 +1511,7 @@ def usage_report(
     phase: str | None,
     recent: int,
     daily: bool,
+    output_format: str,
 ) -> None:
     """Query a SQLite usage database and print a Rich breakdown (v0.11).
 
@@ -1516,6 +1541,123 @@ def usage_report(
     store = UsageStore(db_path)
     summary = store.query_summary(since=since_ts, until=until_ts)
 
+    by_phase_items = list(summary.by_phase.items())
+    if phase:
+        by_phase_items = [(p, b) for p, b in by_phase_items if p == phase]
+
+    events = []
+    if recent > 0:
+        events = store.query_events(
+            since=since_ts,
+            until=until_ts,
+            phase=phase,
+            limit=recent,
+        )
+
+    daily_rows: list[dict] = []
+    days_written = 0
+    if daily:
+        days_written = store.rollup_range(since=since, until=until)
+        daily_rows = store.query_daily(since=since, until=until)
+
+    # v0.13: machine-readable output branches — CSV and JSON emit
+    # clean stdout (no Rich markup) so the command pipes cleanly.
+    if output_format == "json":
+        import json as _json
+
+        payload = {
+            "db": str(db_path),
+            "filter": {
+                "since": since,
+                "until": until,
+                "phase": phase,
+            },
+            "total": {
+                "calls": summary.total_calls,
+                "prompt": summary.total_prompt,
+                "completion": summary.total_completion,
+                "elapsed": summary.total_elapsed,
+            },
+            "by_phase": {
+                p: {
+                    "calls": int(b["calls"]),
+                    "prompt": int(b["prompt"]),
+                    "completion": int(b["completion"]),
+                    "elapsed": float(b["elapsed"]),
+                }
+                for p, b in by_phase_items
+            },
+            "recent": [
+                {
+                    "timestamp": e.timestamp,
+                    "phase": e.phase,
+                    "prompt": e.prompt,
+                    "completion": e.completion,
+                    "elapsed": e.elapsed,
+                }
+                for e in events
+            ],
+            "daily": daily_rows,
+        }
+        click.echo(_json.dumps(payload, ensure_ascii=False, indent=2))
+        store.close()
+        return
+
+    if output_format == "csv":
+        import csv as _csv
+        import io as _io
+
+        buf = _io.StringIO()
+        writer = _csv.writer(buf)
+        writer.writerow(["section", "key", "calls", "prompt", "completion", "elapsed"])
+        writer.writerow(
+            [
+                "total",
+                "-",
+                summary.total_calls,
+                summary.total_prompt,
+                summary.total_completion,
+                f"{summary.total_elapsed:.3f}",
+            ]
+        )
+        for p, b in sorted(by_phase_items):
+            writer.writerow(
+                [
+                    "phase",
+                    p,
+                    int(b["calls"]),
+                    int(b["prompt"]),
+                    int(b["completion"]),
+                    f"{float(b['elapsed']):.3f}",
+                ]
+            )
+        for row in daily_rows:
+            writer.writerow(
+                [
+                    "daily",
+                    row["date"],
+                    row["total_calls"],
+                    row["total_prompt"],
+                    row["total_completion"],
+                    f"{row['total_elapsed']:.3f}",
+                ]
+            )
+        for e in events:
+            writer.writerow(
+                [
+                    "event",
+                    datetime.fromtimestamp(e.timestamp).isoformat(),
+                    1,
+                    e.prompt,
+                    e.completion,
+                    f"{e.elapsed:.3f}",
+                ]
+            )
+        click.echo(buf.getvalue().rstrip("\n"))
+        store.close()
+        return
+
+    # Default: human-friendly Rich table output.
     title_parts = [f"Usage Report ({db_path.name})"]
     if since:
         title_parts.append(f"since={since}")
@@ -1534,11 +1676,8 @@ def usage_report(
 
     if summary.total_calls == 0:
         console.print("[yellow]No events match the filter.[/]")
+        store.close()
         return
-
-    by_phase_items = summary.by_phase.items()
-    if phase:
-        by_phase_items = [(p, b) for p, b in by_phase_items if p == phase]
 
     table = Table(title="By Phase")
     table.add_column("Phase", style="bold")
@@ -1556,41 +1695,29 @@ def usage_report(
         )
     console.print(table)
 
-    if recent > 0:
-        events = store.query_events(
-            since=since_ts,
-            until=until_ts,
-            phase=phase,
-            limit=recent,
-        )
-        if events:
-            console.print(f"\n[bold]Most recent {len(events)} events:[/]")
-            for e in events:
-                ts = datetime.fromtimestamp(e.timestamp).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                console.print(
-                    f"  [dim]{ts}[/] [cyan]{e.phase:<10}[/] "
-                    f"p={e.prompt:,} c={e.completion:,} "
-                    f"({e.elapsed:.1f}s)"
-                )
+    if events:
+        console.print(f"\n[bold]Most recent {len(events)} events:[/]")
+        for e in events:
+            ts = datetime.fromtimestamp(e.timestamp).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            console.print(
+                f"  [dim]{ts}[/] [cyan]{e.phase:<10}[/] "
+                f"p={e.prompt:,} c={e.completion:,} "
+                f"({e.elapsed:.1f}s)"
+            )
 
     if daily:
-        # Rollup any missing days and then query the table for display.
-        # ``since``/``until`` here are ISO date strings (rollup_range
-        # uses date.fromisoformat) rather than datetime timestamps.
-        written = store.rollup_range(since=since, until=until)
-        rows = store.query_daily(since=since, until=until)
-        if rows:
+        if daily_rows:
             daily_table = Table(
-                title=f"Daily Rollup (rolled {written} new days)"
+                title=f"Daily Rollup (rolled {days_written} new days)"
             )
             daily_table.add_column("Date", style="bold")
             daily_table.add_column("Calls", justify="right")
             daily_table.add_column("Prompt", justify="right")
             daily_table.add_column("Completion", justify="right")
             daily_table.add_column("Elapsed (s)", justify="right")
-            for row in rows:
+            for row in daily_rows:
                 daily_table.add_row(
                     row["date"],
                     f"{row['total_calls']:,}",

@@ -130,6 +130,13 @@ pagewiki ask "query" --vault ~/Research --extra-vault ~/Work --per-vault
 # ws://localhost:8000/ask/ws 로 접속해 {"type":"ask","query":"..."} 전송,
 # 진행 중 {"type":"cancel"} 보내면 루프 즉시 중단
 
+# Cross-vault × decompose 조합 (v0.13+): 각 vault에 서브쿼리 분해 적용
+pagewiki ask "X vs Y 비교" --vault ~/Research --extra-vault ~/Work --per-vault --decompose
+
+# usage-report 머신 출력 (v0.13+): 파이프라인 통합
+pagewiki usage-report --db ~/.pagewiki/usage.db --format json > report.json
+pagewiki usage-report --db ~/.pagewiki/usage.db --format csv --recent 50 > events.csv
+
 # LLM-Wiki 컴파일 (v0.3+): entity 추출 → 위키 페이지 자동 생성
 pagewiki compile --folder Research             # → {vault}/LLM-Wiki/
 
@@ -176,7 +183,8 @@ pagewiki ask "query" --vault "~/Documents/Obsidian Vault" --model ollama/gemma4:
 - v0.9: 토큰 예산 한도 (`--max-tokens`), chat 세션 usage 집계, 서버 `/usage` 엔드포인트, cited note BM25 재정렬
 - v0.10: JSON-mode 프롬프트 (`--json-mode`), SQLite usage 영속화 (`serve --usage-db`), SSE 스트리밍 (`POST /ask/stream`), 컨텍스트 reuse (`--reuse-context`)
 - v0.11: `POST /chat/stream` SSE + 라이브 usage 이벤트, 멀티 vault per-vault 캐시 분리, `pagewiki usage-report` 명령, compile 토큰 추적, Obsidian 플러그인 v0.10 flags
-- **v0.12 (현재)**: WebSocket `/ask/ws` (양방향, cancel 지원), daily usage 롤업 (`usage-report --daily`), cross-vault retrieval (`--per-vault`), Obsidian 플러그인 server-mode (SSE 직접 소비)
+- v0.12: WebSocket `/ask/ws` (양방향, cancel 지원), daily usage 롤업 (`usage-report --daily`), cross-vault retrieval (`--per-vault`), Obsidian 플러그인 server-mode (SSE 직접 소비)
+- **v0.13 (현재)**: chat에도 `--json-mode`/`--reuse-context` 노출, SSE usage 이벤트가 실제 LiteLLM 토큰 카운트 사용, 플러그인 WebSocket + Cancel 버튼, cross-vault × decompose 조합, `usage-report --format csv/json`, `retrieval.py` → `retrieval/` 서브패키지 분할
 
 ## Obsidian 플러그인 (v0.6)
 

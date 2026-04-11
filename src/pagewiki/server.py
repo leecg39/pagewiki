@@ -188,7 +188,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.12.0")
+    app = FastAPI(title="pagewiki API", version="0.13.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -289,7 +289,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.12.0",
+            "version": "0.13.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -464,22 +464,41 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             )
 
         # Wrap the shared chat_fn so every call updates BOTH trackers.
-        # This keeps /usage's cumulative counts accurate while
-        # still giving the SSE client a per-request view.
+        # v0.13: snapshot the shared tracker before/after each call so
+        # we can extract the REAL token counts that LiteLLM just
+        # reported (rather than a char/3 estimate). If the shared
+        # tracker wasn't advanced by this call (e.g. the underlying
+        # chat_fn is tracker-less), we fall back to the char/3
+        # estimate so the SSE client still gets a usage frame.
         import time as _time
 
+        shared_tracker = state.tracker
+
         def tracked_chat_fn(prompt: str) -> str:
+            pre_prompt = shared_tracker.total_prompt_tokens
+            pre_completion = shared_tracker.total_completion_tokens
+
             t0 = _time.time()
             response_text = state.chat_fn(prompt)
             elapsed = _time.time() - t0
-            # Best-effort token estimate. The shared chat_fn has
-            # already recorded real counts into state.tracker;
-            # local_tracker uses char/3 estimates so the live delta
-            # is at least directionally accurate.
+
+            delta_prompt = shared_tracker.total_prompt_tokens - pre_prompt
+            delta_completion = (
+                shared_tracker.total_completion_tokens - pre_completion
+            )
+
+            if delta_prompt == 0 and delta_completion == 0:
+                # Shared tracker didn't advance — the underlying
+                # chat_fn doesn't report real tokens. Fall back to
+                # the char/3 heuristic so the client still sees a
+                # meaningful (if approximate) usage frame.
+                delta_prompt = max(1, len(prompt) // 3)
+                delta_completion = max(1, len(response_text) // 3)
+
             local_tracker.record(
                 "other",
-                max(1, len(prompt) // 3),
-                max(1, len(response_text) // 3),
+                delta_prompt,
+                delta_completion,
                 elapsed,
             )
             return response_text
@@ -634,14 +653,29 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         local_tracker = UsageTracker()
         import time as _time
 
+        shared_tracker_ws = state.tracker
+
         def tracked_chat_fn(prompt: str) -> str:
+            pre_prompt = shared_tracker_ws.total_prompt_tokens
+            pre_completion = shared_tracker_ws.total_completion_tokens
+
             t0 = _time.time()
             text = state.chat_fn(prompt)
             elapsed = _time.time() - t0
+
+            # v0.13: real delta from shared tracker with char/3 fallback.
+            delta_prompt = shared_tracker_ws.total_prompt_tokens - pre_prompt
+            delta_completion = (
+                shared_tracker_ws.total_completion_tokens - pre_completion
+            )
+            if delta_prompt == 0 and delta_completion == 0:
+                delta_prompt = max(1, len(prompt) // 3)
+                delta_completion = max(1, len(text) // 3)
+
             local_tracker.record(
                 "other",
-                max(1, len(prompt) // 3),
-                max(1, len(text) // 3),
+                delta_prompt,
+                delta_completion,
                 elapsed,
             )
             return text

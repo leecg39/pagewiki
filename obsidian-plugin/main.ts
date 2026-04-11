@@ -1,13 +1,13 @@
 /**
- * PageWiki Obsidian Plugin (v0.12)
+ * PageWiki Obsidian Plugin (v0.13)
  *
  * Wraps the pagewiki CLI so users can scan, ask, chat, compile, and watch
  * from within Obsidian — no terminal switching required.
  *
- * v0.12 adds an optional "server mode" where Ask/Chat talk directly
- * to a running `pagewiki serve` instance via POST /ask/stream or
- * POST /chat/stream, avoiding the child_process subprocess overhead
- * and showing live SSE trace events as they arrive.
+ * v0.12 added optional "server mode": Ask/Chat can talk directly to a
+ * running `pagewiki serve` instance via POST /ask/stream or POST
+ * /chat/stream. v0.13 extends server mode with WebSocket support so
+ * long-running queries can be cancelled mid-loop via a Cancel button.
  *
  * Version history:
  *   - v0.7: maxWorkers + decomposeByDefault
@@ -16,6 +16,7 @@
  *   - v0.10: --json-mode, --reuse-context flags
  *   - v0.11: Chat modal full flag surface
  *   - v0.12: Server mode (SSE streaming from pagewiki serve)
+ *   - v0.13: WebSocket mode + Cancel button for in-flight queries
  */
 
 import {
@@ -49,6 +50,9 @@ interface PageWikiSettings {
 	// v0.12 — when set, Ask/Chat stream via SSE from this server
 	// instead of spawning `python -m pagewiki` as a subprocess.
 	serverUrl: string;
+	// v0.13 — prefer WebSocket /ask/ws over SSE /ask/stream so
+	// in-flight queries can be cancelled via the Cancel button.
+	useWebSocket: boolean;
 }
 
 const DEFAULT_SETTINGS: PageWikiSettings = {
@@ -63,6 +67,7 @@ const DEFAULT_SETTINGS: PageWikiSettings = {
 	jsonMode: false,
 	reuseContext: false,
 	serverUrl: "",
+	useWebSocket: false,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +100,104 @@ interface SSEEvent {
  * The caller can abort mid-stream by passing an AbortSignal in
  * ``opts.signal``.
  */
+// ─────────────────────────────────────────────────────────────────────────────
+// WebSocket client (v0.13)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface WSCallbacks {
+	onTrace?: (data: any) => void;
+	onUsage?: (data: any) => void;
+	onAnswer?: (data: any) => void;
+	onError?: (data: any) => void;
+	onCancelled?: () => void;
+}
+
+/**
+ * Connect to ``ws://.../ask/ws``, send one ``ask`` message, and
+ * dispatch incoming frames to the provided callbacks.
+ *
+ * Returns a handle with ``cancel()`` that sends ``{type: "cancel"}``
+ * to the server and eventually closes the socket. The promise
+ * resolves when the server finishes streaming (either with an
+ * ``answer``, ``cancelled``, or ``error`` frame).
+ */
+function connectAskWS(
+	wsUrl: string,
+	query: string,
+	decompose: boolean,
+	callbacks: WSCallbacks,
+): { cancel: () => void; finished: Promise<void> } {
+	const ws = new WebSocket(wsUrl);
+
+	let resolveFinished!: () => void;
+	let rejectFinished!: (err: Error) => void;
+	const finished = new Promise<void>((resolve, reject) => {
+		resolveFinished = resolve;
+		rejectFinished = reject;
+	});
+
+	ws.addEventListener("open", () => {
+		ws.send(JSON.stringify({ type: "ask", query, decompose }));
+	});
+
+	ws.addEventListener("message", (ev: MessageEvent) => {
+		let msg: any;
+		try {
+			msg = JSON.parse(ev.data);
+		} catch {
+			return;
+		}
+		switch (msg.type) {
+			case "trace":
+				callbacks.onTrace?.(msg);
+				break;
+			case "usage":
+				callbacks.onUsage?.(msg);
+				break;
+			case "answer":
+				callbacks.onAnswer?.(msg);
+				ws.close();
+				resolveFinished();
+				break;
+			case "cancelled":
+				callbacks.onCancelled?.();
+				ws.close();
+				resolveFinished();
+				break;
+			case "error":
+				callbacks.onError?.(msg);
+				ws.close();
+				rejectFinished(new Error(msg.message || "server error"));
+				break;
+			case "pong":
+				// ignore
+				break;
+		}
+	});
+
+	ws.addEventListener("error", () => {
+		rejectFinished(new Error("WebSocket error"));
+	});
+
+	ws.addEventListener("close", () => {
+		// If we close without resolving, treat as completion.
+		resolveFinished();
+	});
+
+	return {
+		cancel: () => {
+			try {
+				if (ws.readyState === WebSocket.OPEN) {
+					ws.send(JSON.stringify({ type: "cancel" }));
+				}
+			} catch {
+				// swallow
+			}
+		},
+		finished,
+	};
+}
+
 async function streamSSE(
 	url: string,
 	body: object,
@@ -329,9 +432,12 @@ class ChatModal extends Modal {
 	private messagesEl!: HTMLElement;
 	private inputEl!: HTMLTextAreaElement;
 	private submitBtn!: HTMLButtonElement;
+	private cancelBtn!: HTMLButtonElement;
 	private busy = false;
 	// v0.12 server-mode session state.
 	private serverSessionId: string | null = null;
+	// v0.13 currently-running WebSocket handle (if any).
+	private activeWsHandle: { cancel: () => void } | null = null;
 
 	constructor(app: App, settings: PageWikiSettings) {
 		super(app);
@@ -377,6 +483,20 @@ class ChatModal extends Modal {
 		});
 		this.submitBtn.style.alignSelf = "flex-end";
 		this.submitBtn.addEventListener("click", () => this._handleSubmit());
+
+		// v0.13 Cancel button — only useful when server mode is on
+		// and a WebSocket query is in flight.
+		this.cancelBtn = inputWrapper.createEl("button", {
+			text: "Cancel",
+		});
+		this.cancelBtn.style.alignSelf = "flex-end";
+		this.cancelBtn.disabled = true;
+		this.cancelBtn.addEventListener("click", () => {
+			if (this.activeWsHandle) {
+				this.activeWsHandle.cancel();
+				this._appendSystemMessage("Cancel requested — waiting for server...");
+			}
+		});
 
 		this.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
 			if (e.key === "Enter" && !e.shiftKey) {
@@ -500,44 +620,92 @@ class ChatModal extends Modal {
 
 	private async _submitServerMode(query: string): Promise<void> {
 		const base = this.settings.serverUrl.trim().replace(/\/$/, "");
-		const url = `${base}/chat/stream`;
-
-		let answer = "";
-		const cited: string[] = [];
 
 		// Placeholder assistant bubble we mutate in-place as tokens stream.
 		const placeholder = { role: "assistant" as const, text: "…" };
 		this._appendMessage(placeholder);
-		// Reference to the just-appended body span for live updates.
 		const bodySpan = this.messagesEl.lastElementChild?.querySelector(
 			"span",
 		) as HTMLSpanElement | null;
 
-		await streamSSE(
-			url,
-			{
-				query,
-				session_id: this.serverSessionId,
-				decompose: this.settings.decomposeByDefault,
-			},
-			(ev) => {
-				if (ev.event === "trace" && bodySpan) {
-					bodySpan.setText(
-						`[${ev.data.phase}] ${ev.data.detail?.substring(0, 80) ?? ""}`,
-					);
-				} else if (ev.event === "answer") {
-					answer = ev.data.answer || "";
-					if (Array.isArray(ev.data.cited_nodes)) {
-						cited.push(...ev.data.cited_nodes);
+		let answer = "";
+		const cited: string[] = [];
+		let cancelled = false;
+
+		// v0.13: when useWebSocket is enabled, use /ask/ws for
+		// cancellation support. Chat mode history isn't yet
+		// bridged through WebSocket, so we prepend context manually
+		// (same pattern as CLI fallback).
+		if (this.settings.useWebSocket) {
+			const wsUrl = base.replace(/^http/, "ws") + "/ask/ws";
+			const contextQuery = this._buildContextQuery(query);
+
+			this.cancelBtn.disabled = false;
+
+			const handle = connectAskWS(
+				wsUrl,
+				contextQuery,
+				this.settings.decomposeByDefault,
+				{
+					onTrace: (data) => {
+						if (bodySpan) {
+							bodySpan.setText(
+								`[${data.phase}] ${data.detail?.substring(0, 80) ?? ""}`,
+							);
+						}
+					},
+					onAnswer: (data) => {
+						answer = data.answer || "";
+						if (Array.isArray(data.cited_nodes)) {
+							cited.push(...data.cited_nodes);
+						}
+					},
+					onCancelled: () => {
+						cancelled = true;
+					},
+				},
+			);
+
+			this.activeWsHandle = handle;
+			try {
+				await handle.finished;
+			} finally {
+				this.activeWsHandle = null;
+				this.cancelBtn.disabled = true;
+			}
+
+			if (cancelled) {
+				answer = answer || "[cancelled]";
+			}
+		} else {
+			// SSE path (v0.12 default).
+			const url = `${base}/chat/stream`;
+			await streamSSE(
+				url,
+				{
+					query,
+					session_id: this.serverSessionId,
+					decompose: this.settings.decomposeByDefault,
+				},
+				(ev) => {
+					if (ev.event === "trace" && bodySpan) {
+						bodySpan.setText(
+							`[${ev.data.phase}] ${ev.data.detail?.substring(0, 80) ?? ""}`,
+						);
+					} else if (ev.event === "answer") {
+						answer = ev.data.answer || "";
+						if (Array.isArray(ev.data.cited_nodes)) {
+							cited.push(...ev.data.cited_nodes);
+						}
+						if (typeof ev.data.session_id === "string") {
+							this.serverSessionId = ev.data.session_id;
+						}
+					} else if (ev.event === "error") {
+						throw new Error(ev.data.message || "server error");
 					}
-					if (typeof ev.data.session_id === "string") {
-						this.serverSessionId = ev.data.session_id;
-					}
-				} else if (ev.event === "error") {
-					throw new Error(ev.data.message || "server error");
-				}
-			},
-		);
+				},
+			);
+		}
 
 		if (bodySpan) {
 			bodySpan.setText(
@@ -547,7 +715,6 @@ class ChatModal extends Modal {
 						: ""),
 			);
 		}
-		// Keep local history in sync (for buildContextQuery fallback).
 		placeholder.text = answer;
 	}
 
@@ -786,6 +953,22 @@ class PageWikiSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.serverUrl)
 					.onChange(async (value) => {
 						this.plugin.settings.serverUrl = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Use WebSocket (Cancel support)")
+			.setDesc(
+				"When server mode is active, use /ask/ws (WebSocket) instead " +
+				"of /chat/stream (SSE) so in-flight queries can be cancelled " +
+				"via the Cancel button in the Chat modal (v0.13).",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.useWebSocket)
+					.onChange(async (value) => {
+						this.plugin.settings.useWebSocket = value;
 						await this.plugin.saveSettings();
 					}),
 			);
