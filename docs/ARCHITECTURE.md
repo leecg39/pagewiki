@@ -140,7 +140,13 @@ pagewiki/
 │   ├── tree.py               # TreeNode pydantic 모델
 │   ├── vault.py              # Layer 1 스캐너 + 분류기 + filter_tree
 │   ├── pageindex_adapter.py  # Layer 2 어댑터
-│   ├── retrieval.py          # Multi-hop reasoning 루프 (on_event 스트리밍)
+│   ├── retrieval/            # Multi-hop reasoning (v0.13 split)
+│   │   ├── __init__.py       #   public API re-exports
+│   │   ├── types.py          #   TraceStep, RetrievalResult, ChatFn
+│   │   ├── helpers.py        #   tree helpers + _load_note_content
+│   │   ├── core.py           #   run_retrieval (main loop)
+│   │   ├── decompose.py      #   run_decomposed_retrieval
+│   │   └── cross_vault.py    #   run_cross_vault_retrieval
 │   ├── prompts.py            # 프롬프트 템플릿 (select/evaluate/final/chat)
 │   ├── frontmatter.py        # YAML frontmatter 파서 (v0.6)
 │   ├── cache.py              # TreeCache + SummaryCache (v0.6)
@@ -213,7 +219,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.9 | 토큰 예산 + chat usage + /usage endpoint + cited 재정렬 — 아래 §7.4 상세 |
 | v0.10 | JSON-mode + SQLite usage + SSE 스트리밍 + context reuse — 아래 §7.5 상세 |
 | v0.11 | /chat/stream + usage 이벤트 + per-vault 캐시 + usage-report CLI — 아래 §7.6 상세 |
-| **v0.12** (현재) | **WebSocket + daily 롤업 + cross-vault + 플러그인 server-mode** — 아래 §7.7 상세 |
+| v0.12 | WebSocket + daily 롤업 + cross-vault + 플러그인 server-mode — 아래 §7.7 상세 |
+| **v0.13** (현재) | **폴리싱 + 리팩토링 — chat flags, real tokens, plugin Cancel, cross-vault×decompose, CSV/JSON, retrieval split** — 아래 §7.8 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -293,12 +300,24 @@ DELETE /chat/{sid}      # 세션 삭제
 | Cross-vault retrieval | retrieval.py `run_cross_vault_retrieval` | 멀티 vault를 하나의 가상 루트로 merge하는 대신 **각 vault에서 독립적으로 full retrieval 실행 → 결과 synthesize**. 각 vault의 wiki-link 인덱스가 스코프 유지되어 spurious cross-vault 링크 해결 방지. `cited_nodes`는 `<vault_name>::` 프리픽스로 attribution. CLI `ask --per-vault` (멀티 vault 시에만 의미). |
 | 플러그인 server-mode | obsidian-plugin/main.ts `streamSSE`, `_runAskServerMode`, `_submitServerMode` | 새 `serverUrl` 설정이 비어있지 않으면 `fetch('/ask/stream')` 또는 `/chat/stream`로 직접 POST하고 SSE를 파싱. Node.js `ReadableStream` + 프레임 분리기로 `trace`/`usage`/`answer` 이벤트 처리. ChatModal은 live placeholder를 mutate해 스트리밍 중 진행 표시. session_id 자동 유지로 후속 질문이 서버-side history 활용. |
 
-### 7.8 v0.13+ 향후 계획
+### 7.8 v0.13 상세 (폴리싱 + 리팩토링)
 
-- 플러그인에서 WebSocket 직접 소비 (cancel 버튼)
-- Usage DB에 rolling retention (오래된 raw events 삭제 후 rollup만 유지)
-- Cross-vault + decompose 조합
-- `run_retrieval`의 budget 분배 정책 (summarize vs retrieve 비율 tuning)
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| chat flags 확장 | cli.py `chat` | `--json-mode` / `--reuse-context` 노출. ask에만 있던 v0.10 flags 를 chat에도 forwarding. |
+| 실제 LiteLLM 토큰 | server.py `_stream_retrieval`, `ask_ws` | per-request `local_tracker`가 `state.tracker`의 before/after delta를 읽어 char/3 추정치가 아닌 실제 LiteLLM 토큰 카운트를 SSE/WS usage 이벤트로 emit. 공유 tracker가 advance 하지 않으면 char/3 fallback. |
+| 플러그인 WebSocket + Cancel | obsidian-plugin/main.ts `connectAskWS`, ChatModal `cancelBtn` | 새 `useWebSocket` 설정이 활성화되면 `/ask/ws`로 접속해 진행 중 취소 가능. ChatModal에 "Cancel" 버튼이 활성 WS 핸들의 cancel() 호출. 서버는 `threading.Event`로 루프에 신호 → `should_stop` 콜백이 clean abort. |
+| Cross-vault × decompose | retrieval/cross_vault.py `decompose` 파라미터 | `run_cross_vault_retrieval(decompose=True)` 시 각 vault에서 `run_decomposed_retrieval` 실행 → vault별 분해-합성 → cross-vault 최종 합성. CLI `ask --per-vault --decompose`로 활성화. |
+| usage-report CSV/JSON | cli.py `usage_report`, `--format` 옵션 | `--format json` / `--format csv` 머신 출력. Rich 마크업 없이 `click.echo`로 clean stdout. JSON은 total + by_phase + recent + daily 통합 페이로드, CSV는 section-tagged rows. |
+| retrieval 패키지 분할 | src/pagewiki/retrieval/{types,helpers,core,decompose,cross_vault}.py | 846줄 단일 파일을 5개 모듈 subpackage로 분할. `__init__.py`가 public API 재노출해 기존 import 호환 유지 (`from pagewiki.retrieval import run_retrieval` 그대로 작동). |
+
+### 7.9 v0.14+ 향후 계획
+
+- Usage DB rolling retention (오래된 raw events 삭제 후 rollup만 유지)
+- Budget 분배 정책 (summarize vs retrieve 비율 tuning, `--token-split`)
+- `/usage/history` 엔드포인트로 서버에서 바로 historical 쿼리
+- Prompt caching (Ollama 지원 시)
+- Web UI (`pagewiki serve`에 간단한 HTML frontend)
 
 ## 8. 명시적 비목표 (Non-Goals)
 
