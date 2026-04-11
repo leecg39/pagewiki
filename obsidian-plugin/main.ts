@@ -1,5 +1,5 @@
 /**
- * PageWiki Obsidian Plugin (v0.6)
+ * PageWiki Obsidian Plugin (v0.7)
  *
  * Wraps the pagewiki CLI so users can scan, ask, chat, compile, and watch
  * from within Obsidian — no terminal switching required.
@@ -7,6 +7,10 @@
  * Commands are executed via Node child_process.exec against the
  * `pagewiki` CLI that the user has already pip-installed. Results
  * are displayed in Obsidian modals with Rich-markup stripped.
+ *
+ * v0.7 additions:
+ *   - `maxWorkers` setting for parallel LLM calls
+ *   - `decompose` toggle per-query for multi-sub-question retrieval
  */
 
 import {
@@ -29,6 +33,8 @@ interface PageWikiSettings {
 	numCtx: number;
 	folder: string;
 	pythonPath: string;
+	maxWorkers: number;
+	decomposeByDefault: boolean;
 }
 
 const DEFAULT_SETTINGS: PageWikiSettings = {
@@ -36,6 +42,8 @@ const DEFAULT_SETTINGS: PageWikiSettings = {
 	numCtx: 131072,
 	folder: "Research",
 	pythonPath: "python",
+	maxWorkers: 4,
+	decomposeByDefault: false,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,12 +127,18 @@ class ResultModal extends Modal {
 
 class AskModal extends Modal {
 	private settings: PageWikiSettings;
-	private onSubmit: (query: string) => void;
+	private onSubmit: (query: string, decompose: boolean) => void;
+	private decomposeChecked: boolean;
 
-	constructor(app: App, settings: PageWikiSettings, onSubmit: (q: string) => void) {
+	constructor(
+		app: App,
+		settings: PageWikiSettings,
+		onSubmit: (q: string, decompose: boolean) => void,
+	) {
 		super(app);
 		this.settings = settings;
 		this.onSubmit = onSubmit;
+		this.decomposeChecked = settings.decomposeByDefault;
 	}
 
 	onOpen(): void {
@@ -145,14 +159,38 @@ class AskModal extends Modal {
 			queryText = value;
 		});
 
-		const submitBtn = contentEl.createEl("button", {
+		// v0.7 decompose toggle (per-query override).
+		const controlsRow = contentEl.createDiv();
+		controlsRow.style.display = "flex";
+		controlsRow.style.alignItems = "center";
+		controlsRow.style.gap = "12px";
+		controlsRow.style.marginBottom = "12px";
+
+		const decomposeLabel = controlsRow.createEl("label");
+		decomposeLabel.style.display = "flex";
+		decomposeLabel.style.alignItems = "center";
+		decomposeLabel.style.gap = "6px";
+		decomposeLabel.style.fontSize = "13px";
+		decomposeLabel.style.color = "var(--text-muted)";
+
+		const decomposeInput = decomposeLabel.createEl("input", {
+			type: "checkbox",
+		}) as HTMLInputElement;
+		decomposeInput.checked = this.decomposeChecked;
+		decomposeInput.addEventListener("change", () => {
+			this.decomposeChecked = decomposeInput.checked;
+		});
+		decomposeLabel.appendText("Decompose complex query (v0.7)");
+
+		const submitBtn = controlsRow.createEl("button", {
 			text: "Ask",
 			cls: "mod-cta",
 		});
+		submitBtn.style.marginLeft = "auto";
 		submitBtn.addEventListener("click", () => {
 			if (queryText.trim()) {
 				this.close();
-				this.onSubmit(queryText.trim());
+				this.onSubmit(queryText.trim(), this.decomposeChecked);
 			}
 		});
 
@@ -162,7 +200,7 @@ class AskModal extends Modal {
 				e.preventDefault();
 				if (queryText.trim()) {
 					this.close();
-					this.onSubmit(queryText.trim());
+					this.onSubmit(queryText.trim(), this.decomposeChecked);
 				}
 			}
 		});
@@ -316,9 +354,13 @@ class ChatModal extends Modal {
 		try {
 			const contextQuery = this._buildContextQuery(query);
 			const escaped = contextQuery.replace(/"/g, '\\"');
-			const args =
+			let args =
 				`ask "${escaped}" --folder "${this.settings.folder}" ` +
-				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx}`;
+				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx} ` +
+				`--max-workers ${this.settings.maxWorkers}`;
+			if (this.settings.decomposeByDefault) {
+				args += " --decompose";
+			}
 			const output = await runPagewiki(this.app, this.settings, args);
 
 			// Extract the answer line from CLI output (after "A: ")
@@ -445,6 +487,42 @@ class PageWikiSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}),
 			);
+
+		new Setting(containerEl)
+			.setName("Max parallel LLM workers")
+			.setDesc(
+				"Number of concurrent LLM calls during summarization and " +
+				"compilation (v0.7). Higher values speed up bulk work but " +
+				"may thrash VRAM. Default: 4.",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("4")
+					.setValue(String(this.plugin.settings.maxWorkers))
+					.onChange(async (value) => {
+						const num = parseInt(value, 10);
+						if (!isNaN(num) && num >= 1) {
+							this.plugin.settings.maxWorkers = num;
+							await this.plugin.saveSettings();
+						}
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Decompose complex queries by default")
+			.setDesc(
+				"When enabled, every Ask request uses --decompose to split " +
+				"complex questions into sub-queries (v0.7). Slower but " +
+				"produces better answers on multi-part questions.",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.decomposeByDefault)
+					.onChange(async (value) => {
+						this.plugin.settings.decomposeByDefault = value;
+						await this.plugin.saveSettings();
+					}),
+			);
 	}
 }
 
@@ -549,20 +627,29 @@ export default class PageWikiPlugin extends Plugin {
 	}
 
 	private openAskModal(): void {
-		new AskModal(this.app, this.settings, (query) => this.runAsk(query)).open();
+		new AskModal(
+			this.app,
+			this.settings,
+			(query, decompose) => this.runAsk(query, decompose),
+		).open();
 	}
 
 	private openChatModal(): void {
 		new ChatModal(this.app, this.settings).open();
 	}
 
-	private async runAsk(query: string): Promise<void> {
+	private async runAsk(query: string, decompose?: boolean): Promise<void> {
 		const notice = new Notice("PageWiki: Thinking...", 0);
 		try {
 			const escaped = query.replace(/"/g, '\\"');
-			const args =
+			const useDecompose = decompose ?? this.settings.decomposeByDefault;
+			let args =
 				`ask "${escaped}" --folder "${this.settings.folder}" ` +
-				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx}`;
+				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx} ` +
+				`--max-workers ${this.settings.maxWorkers}`;
+			if (useDecompose) {
+				args += " --decompose";
+			}
 			const output = await runPagewiki(this.app, this.settings, args);
 			notice.hide();
 			new ResultModal(this.app, "Answer", output).open();
@@ -577,7 +664,8 @@ export default class PageWikiPlugin extends Plugin {
 		try {
 			const args =
 				`compile --folder "${this.settings.folder}" ` +
-				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx}`;
+				`--model "${this.settings.model}" --num-ctx ${this.settings.numCtx} ` +
+				`--max-workers ${this.settings.maxWorkers}`;
 			const output = await runPagewiki(this.app, this.settings, args);
 			notice.hide();
 			new ResultModal(this.app, "LLM-Wiki Compiled", output).open();

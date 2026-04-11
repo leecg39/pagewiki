@@ -25,21 +25,29 @@ Run with::
 
     pagewiki serve --vault <path> --folder Research --port 8000
 
-Then:
+Then::
 
-    curl -X POST http://localhost:8000/ask \
-        -H 'Content-Type: application/json' \
+    curl -X POST http://localhost:8000/ask \\
+        -H 'Content-Type: application/json' \\
         -d '{"query": "What is X?"}'
-"""
 
-from __future__ import annotations
+Note on annotations
+-------------------
+
+This module intentionally does NOT use ``from __future__ import annotations``.
+The Pydantic request/response models defined below are consumed by
+FastAPI's type adapter, which needs resolved (non-ForwardRef) class
+references to build its request validators. Enabling PEP 563 lazy
+annotations would turn ``AskRequest`` into a string that FastAPI
+can't resolve out of this module's namespace.
+"""
 
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .cache import SummaryCache, TreeCache
 from .retrieval import (
@@ -58,9 +66,6 @@ from .vault import (
 )
 from .wiki_links import LinkIndex, build_link_index
 
-if TYPE_CHECKING:
-    from fastapi import FastAPI
-
 ChatFn = Callable[[str], str]
 
 # Chat sessions expire after 1 hour of inactivity.
@@ -70,6 +75,16 @@ SESSION_TTL_SECONDS = 3600
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared state
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class ChatSession:
+    """Server-side conversation state for one chat client."""
+
+    sid: str
+    history: list[tuple[str, str]] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+    last_active: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -132,16 +147,6 @@ class ServerState:
         }
 
 
-@dataclass
-class ChatSession:
-    """Server-side conversation state for one chat client."""
-
-    sid: str
-    history: list[tuple[str, str]] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
-    last_active: float = field(default_factory=time.time)
-
-
 def _prune_expired_sessions(state: ServerState) -> None:
     """Drop sessions that haven't been touched in SESSION_TTL_SECONDS."""
     cutoff = time.time() - SESSION_TTL_SECONDS
@@ -155,7 +160,7 @@ def _prune_expired_sessions(state: ServerState) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def create_app(state: ServerState) -> FastAPI:
+def create_app(state: ServerState):  # -> fastapi.FastAPI
     """Build a FastAPI application bound to the given server state.
 
     FastAPI + Pydantic are imported inside this function so they
@@ -163,7 +168,7 @@ def create_app(state: ServerState) -> FastAPI:
     clear install hint if either is missing.
     """
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import Body, FastAPI, HTTPException
         from pydantic import BaseModel, Field
     except ImportError as e:
         raise RuntimeError(
@@ -266,8 +271,12 @@ def create_app(state: ServerState) -> FastAPI:
         summary = state.rescan()
         return ScanResponse(**summary)
 
+    # FastAPI idiomatic Body(...) default is used below. Ruff's B008
+    # rule is silenced per handler because FastAPI's dependency
+    # injection requires the call to live in the default slot.
+
     @app.post("/ask", response_model=AskResponse)
-    def ask(req: AskRequest) -> AskResponse:
+    def ask(req: AskRequest = Body(...)) -> AskResponse:  # noqa: B008
         result = _run(
             req.query,
             decompose=req.decompose,
@@ -284,7 +293,7 @@ def create_app(state: ServerState) -> FastAPI:
         )
 
     @app.post("/chat", response_model=ChatResponse)
-    def chat(req: ChatRequest) -> ChatResponse:
+    def chat(req: ChatRequest = Body(...)) -> ChatResponse:  # noqa: B008
         _prune_expired_sessions(state)
 
         sid = req.session_id or uuid.uuid4().hex
