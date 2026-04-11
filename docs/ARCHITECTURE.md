@@ -208,7 +208,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.5 | Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile/Watch 실행, Settings 탭, 결과 모달 |
 | v0.6 | 대화형 모드 + 캐시 + 필터 + 스트리밍 — 아래 §7.1 상세 |
 | v0.7 | 병렬 LLM + 멀티쿼리 분해 + 멀티 vault + API 서버 — 아래 §7.2 상세 |
-| **v0.8** (현재) | **토큰 사용량 추적 + 파싱 재시도 + BM25 사전 랭킹** — 아래 §7.3 상세 |
+| v0.8 | 토큰 사용량 추적 + 파싱 재시도 + BM25 사전 랭킹 — 아래 §7.3 상세 |
+| **v0.9** (현재) | **토큰 예산 + chat usage + /usage endpoint + cited 재정렬** — 아래 §7.4 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -249,12 +250,21 @@ DELETE /chat/{sid}      # 세션 삭제
 | BM25 사전 랭킹 | ranking.py | Zero-LLM 비용의 candidate 사전 정렬. 토큰 overlap 기반 BM25-style 스코어 + 짧은 후보 보너스. 정렬된 목록을 SELECT 프롬프트에 전달 → LLM이 적은 iteration으로 정답 도달. Korean/English 혼용 vault 지원. |
 | 서버 엔드포인트 테스트 | tests/test_server.py | FastAPI `TestClient` 기반 11개 테스트. /health, /scan, /ask, /chat (세션 생성/누적/삭제/만료) 검증. FastAPI 미설치 시 `pytest.importorskip`로 clean skip. |
 
-### 7.4 v0.9+ 향후 계획
+### 7.4 v0.9 상세
+
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| 토큰 예산 한도 | retrieval.py `run_retrieval`, `run_decomposed_retrieval` | 새 `max_tokens` + `tracker` 매개변수. 매 iteration 시작 전에 `tracker.total_tokens >= max_tokens`를 검사하고 초과 시 루프를 clean abort. 초과 상태에서 answer 합성 비용까지 아끼기 위해 final answer도 raw 근거 concat으로 fall back. CLI `ask --max-tokens N`, `chat --max-tokens N` (per-turn 예산). |
+| Chat 세션 usage | cli.py `chat` | `UsageTracker`가 세션 전체에 걸쳐 cumulative 집계. 매 turn마다 pre-turn snapshot과 delta를 비교해 per-turn 토큰 + call 수를 표시. 종료 시 phase별 Rich 테이블 출력. `--max-tokens`는 per-turn 예산 (세션 누적이 아님). |
+| Server `/usage` | server.py `GET /usage`, `POST /usage/reset` | `ServerState.tracker`가 서버 lifetime 동안 모든 LLM 호출 누적. FastAPI 엔드포인트로 cumulative counts + phase 분해 반환. reset 엔드포인트로 모니터링 윈도우 초기화 가능. |
+| Cited note 재정렬 | retrieval.py + ranking.py | `gathered` 목록을 `rank_candidates`로 쿼리 관련도 순으로 재정렬해 `cited_nodes`가 discovery order가 아닌 relevance order로 반환. Zero-LLM 비용 (기존 BM25 스코어러 재사용). |
+
+### 7.5 v0.10+ 향후 계획
 
 - Pydantic JSON-mode 출력 (LLM이 JSON으로 응답 → strict 파싱)
 - 컨텍스트 reuse: 반복 iteration 시 ToC 델타만 재전송
-- Usage 예산 제한 (`--max-tokens`로 쿼리당 예산 하드 캡)
-- Re-ranking: gathered notes를 LLM에 다시 물어 최종 인용 우선순위 정렬
+- Usage persistence: 서버 재시작 후에도 누적 사용량 유지 (SQLite)
+- Streaming responses: `POST /ask` SSE 스트리밍으로 실시간 trace 전달
 
 ## 8. 명시적 비목표 (Non-Goals)
 

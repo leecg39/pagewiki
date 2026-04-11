@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .prompts import (
     NodeSummary,
@@ -36,6 +37,9 @@ from .prompts import (
 from .tree import TreeNode
 from .wiki_links import LinkIndex, build_link_index
 
+if TYPE_CHECKING:
+    from .usage import UsageTracker
+
 ChatFn = Callable[[str], str]
 EventCallback = Callable[["TraceStep"], None] | None
 
@@ -43,7 +47,6 @@ EventCallback = Callable[["TraceStep"], None] | None
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_MAX_GATHERED_NOTES = 4
 DEFAULT_MAX_NOTE_CHARS = 20_000
-
 
 @dataclass
 class TraceStep:
@@ -144,6 +147,8 @@ def run_retrieval(
     link_index: LinkIndex | None = None,
     on_event: EventCallback = None,
     history: list[tuple[str, str]] | None = None,
+    max_tokens: int | None = None,
+    tracker: UsageTracker | None = None,
 ) -> RetrievalResult:
     """Run the multi-hop reasoning loop.
 
@@ -161,6 +166,17 @@ def run_retrieval(
             built one.
         on_event: Optional callback invoked for each ``TraceStep`` as it
             is recorded. Used by the CLI to stream progress in real-time.
+        history: Optional list of prior ``(question, answer)`` turns from
+            chat mode. When provided, the final-answer prompt includes
+            the conversation context.
+        max_tokens: Optional hard cap on total tokens used during this
+            retrieval (v0.9). Requires ``tracker`` to be provided.
+            When the tracker's total exceeds this value, the loop
+            aborts cleanly with a "budget exceeded" reason.
+        tracker: Optional ``UsageTracker`` instance used for budget
+            enforcement. The caller is responsible for wiring
+            ``chat_fn`` through a tracking wrapper so usage is
+            actually recorded.
 
     Returns:
         RetrievalResult with answer, cited node ids, and reasoning trace.
@@ -192,8 +208,24 @@ def run_retrieval(
     iteration = 0
     done_reason: str | None = None
 
+    def _budget_exceeded() -> bool:
+        if max_tokens is None or tracker is None:
+            return False
+        return tracker.total_tokens >= max_tokens
+
     while iteration < max_iterations and len(gathered) < max_gathered:
         iteration += 1
+
+        # v0.9 token budget check — abort the loop if the caller-
+        # specified cap has been hit. We check before every LLM call
+        # rather than after so a single oversized prompt can't blow
+        # past the budget silently.
+        if _budget_exceeded():
+            done_reason = (
+                f"토큰 예산 초과: {tracker.total_tokens:,} >= {max_tokens:,}"
+            )
+            _record(TraceStep("budget", None, done_reason))
+            break
 
         tree_candidates = [
             child for child in cursor.children if child.node_id not in visited_ids
@@ -379,12 +411,36 @@ def run_retrieval(
             f"[근거 부족] 탐색 결과 관련 노트를 찾지 못했습니다. "
             f"이유: {done_reason or '후보 소진'}"
         )
+    elif _budget_exceeded():
+        # v0.9 — budget already exhausted; return the raw evidence
+        # concatenated as a partial answer rather than paying for
+        # one more synthesis call.
+        parts = ["[토큰 예산 초과 — 부분 결과만 반환]"]
+        for title, content in gathered:
+            parts.append(f"\n## {title}\n{content[:1000]}")
+        answer = "\n".join(parts)
     elif history:
         final_prompt = final_answer_with_history_prompt(query, gathered, history)
         answer = chat_fn(final_prompt).strip()
     else:
         final_prompt = final_answer_prompt(query, gathered)
         answer = chat_fn(final_prompt).strip()
+
+    # v0.9 cited-note re-ranking: sort citations by BM25 relevance to
+    # the original query so the most important source appears first
+    # in the cited_nodes list. Discovery order is an artifact of
+    # traversal, not relevance — this is a zero-LLM fix. When gathering
+    # 0 or 1 notes there is nothing to reorder.
+    if len(gathered) > 1:
+        from .ranking import rank_candidates
+
+        searchable = [
+            (title, f"{title} {content[:2000]}")
+            for title, content in gathered
+        ]
+        order = rank_candidates(query, searchable)
+        reordered_cited = [cited[i] for i, _ in order]
+        cited = reordered_cited
 
     _record(
         TraceStep(
@@ -417,6 +473,8 @@ def run_decomposed_retrieval(
     link_index: LinkIndex | None = None,
     on_event: EventCallback = None,
     max_sub_queries: int = 4,
+    max_tokens: int | None = None,
+    tracker: UsageTracker | None = None,
 ) -> RetrievalResult:
     """Decompose a complex query into sub-queries, retrieve in parallel, synthesize.
 
@@ -430,6 +488,10 @@ def run_decomposed_retrieval(
          answers using ``synthesize_multi_answer_prompt``.
 
     All sub-query cited_nodes are merged (deduplicated) into the result.
+
+    The ``max_tokens`` / ``tracker`` pair is forwarded to every
+    per-sub-query ``run_retrieval`` call so the budget is enforced
+    across the entire decomposed flow, not just one sub-query.
     """
     # Phase 1: decompose.
     decomp_prompt = decompose_query_prompt(query, max_sub_queries=max_sub_queries)
@@ -446,6 +508,8 @@ def run_decomposed_retrieval(
             max_gathered=max_gathered,
             link_index=link_index,
             on_event=on_event,
+            max_tokens=max_tokens,
+            tracker=tracker,
         )
 
     if on_event is not None:
@@ -479,6 +543,8 @@ def run_decomposed_retrieval(
             max_gathered=max_gathered,
             link_index=link_index,
             on_event=on_event,
+            max_tokens=max_tokens,
+            tracker=tracker,
         )
         sub_results.append((sub, sub_result))
         merged_trace.extend(sub_result.trace)

@@ -57,6 +57,7 @@ from .retrieval import (
     run_retrieval,
 )
 from .tree import NoteTier, TreeNode
+from .usage import UsageTracker
 from .vault import (
     build_long_subtrees,
     filter_tree,
@@ -102,6 +103,10 @@ class ServerState:
     summary_cache: SummaryCache
     tree_cache: TreeCache
     sessions: dict[str, ChatSession] = field(default_factory=dict)
+    # v0.9 cumulative usage tracker — shared by every /ask and /chat
+    # call so operators can monitor token budgets across the whole
+    # server lifetime via GET /usage.
+    tracker: UsageTracker = field(default_factory=UsageTracker)
 
     def rescan(self) -> dict[str, int]:
         """Re-scan the vault(s) and rebuild caches in place.
@@ -177,7 +182,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.7.0")
+    app = FastAPI(title="pagewiki API", version="0.9.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -214,6 +219,20 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count: int
         long_count: int
         summarized: int
+
+    class PhaseUsage(BaseModel):
+        calls: int
+        prompt: int
+        completion: int
+        elapsed: float
+
+    class UsageResponse(BaseModel):
+        total_calls: int
+        total_prompt_tokens: int
+        total_completion_tokens: int
+        total_tokens: int
+        total_elapsed: float
+        by_phase: dict[str, PhaseUsage]
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -259,7 +278,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.7.0",
+            "version": "0.9.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -325,6 +344,35 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             raise HTTPException(status_code=404, detail=f"Session {sid} not found")
         del state.sessions[sid]
         return {"status": "cleared", "session_id": sid}
+
+    # ── v0.9 usage endpoints ──────────────────────────────────────────────
+
+    @app.get("/usage", response_model=UsageResponse)
+    def get_usage() -> UsageResponse:
+        """Return cumulative token usage since server startup (v0.9)."""
+        t = state.tracker
+        return UsageResponse(
+            total_calls=t.total_calls,
+            total_prompt_tokens=t.total_prompt_tokens,
+            total_completion_tokens=t.total_completion_tokens,
+            total_tokens=t.total_tokens,
+            total_elapsed=t.total_elapsed,
+            by_phase={
+                phase: PhaseUsage(
+                    calls=int(b["calls"]),
+                    prompt=int(b["prompt"]),
+                    completion=int(b["completion"]),
+                    elapsed=float(b["elapsed"]),
+                )
+                for phase, b in t.by_phase().items()
+            },
+        )
+
+    @app.post("/usage/reset")
+    def reset_usage() -> dict[str, str]:
+        """Clear the cumulative usage tracker (v0.9)."""
+        state.tracker.events.clear()
+        return {"status": "reset"}
 
     return app
 

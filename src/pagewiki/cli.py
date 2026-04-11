@@ -677,6 +677,13 @@ def watch(
     is_flag=True,
     help="Print token usage breakdown at the end of the query (v0.8).",
 )
+@click.option(
+    "--max-tokens",
+    "max_tokens",
+    default=None,
+    type=int,
+    help="Hard cap on total tokens for this query. Loop aborts when exceeded (v0.9).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -692,6 +699,7 @@ def ask(
     max_workers: int,
     decompose: bool,
     usage: bool,
+    max_tokens: int | None,
 ) -> None:
     """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
@@ -719,9 +727,11 @@ def ask(
 
     start = time.time()
 
-    # v0.8: optional token usage tracking.
+    # v0.8: optional token usage tracking (v0.9: also auto-enabled
+    # when --max-tokens is set, since budget enforcement needs a
+    # tracker to compare against).
     from .usage import UsageTracker
-    tracker = UsageTracker() if usage else None
+    tracker = UsageTracker() if (usage or max_tokens is not None) else None
     chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker)
 
     # Step 1: scan (multi-vault aware)
@@ -815,11 +825,15 @@ def ask(
 
     if decompose:
         result = run_decomposed_retrieval(
-            query, root, chat_fn, link_index=link_index, on_event=_on_event,
+            query, root, chat_fn,
+            link_index=link_index, on_event=_on_event,
+            max_tokens=max_tokens, tracker=tracker,
         )
     else:
         result = run_retrieval(
-            query, root, chat_fn, link_index=link_index, on_event=_on_event,
+            query, root, chat_fn,
+            link_index=link_index, on_event=_on_event,
+            max_tokens=max_tokens, tracker=tracker,
         )
 
     elapsed = time.time() - start
@@ -916,6 +930,17 @@ def ask(
     "--decompose", is_flag=True,
     help="Decompose complex queries into sub-questions (v0.7).",
 )
+@click.option(
+    "--usage", is_flag=True,
+    help="Print cumulative token usage after each turn (v0.9).",
+)
+@click.option(
+    "--max-tokens",
+    "max_tokens",
+    default=None,
+    type=int,
+    help="Per-turn token budget. Each chat turn aborts if exceeded (v0.9).",
+)
 def chat(
     vault: Path | None,
     extra_vaults: tuple[Path, ...],
@@ -928,6 +953,8 @@ def chat(
     filter_before: str | None,
     max_workers: int,
     decompose: bool,
+    usage: bool,
+    max_tokens: int | None,
 ) -> None:
     """Interactive multi-turn conversation against a vault folder.
 
@@ -938,6 +965,7 @@ def chat(
     from .prompts import rewrite_query_with_context
     from .retrieval import TraceStep as _TraceStep
     from .retrieval import run_decomposed_retrieval
+    from .usage import UsageTracker
     from .wiki_links import build_link_index
 
     # Resolve primary + extra vaults for multi-vault support (v0.7).
@@ -969,7 +997,10 @@ def chat(
         )
     )
 
-    chat_fn = _make_chat_fn(model, num_ctx)
+    # v0.9: tracker is cumulative across the whole chat session.
+    # Auto-enabled when --max-tokens is set even without --usage.
+    tracker = UsageTracker() if (usage or max_tokens is not None) else None
+    chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker)
 
     # Pre-scan once so repeated queries reuse the same tree.
     console.print("[dim]Scanning vault...[/]")
@@ -1056,6 +1087,10 @@ def chat(
         turn += 1
         start = time.time()
 
+        # v0.9: snapshot pre-turn usage so we can compute this turn's delta.
+        pre_turn_tokens = tracker.total_tokens if tracker is not None else 0
+        pre_turn_calls = tracker.total_calls if tracker is not None else 0
+
         # Rewrite follow-up queries into standalone form.
         effective_query = query
         if history:
@@ -1064,15 +1099,23 @@ def chat(
                 console.print(f"[dim]  → rewritten: {rewritten}[/]")
                 effective_query = rewritten
 
+        # v0.9: per-turn budget tracked against pre_turn_tokens snapshot.
+        # When --max-tokens is set, each turn gets its own allowance.
+        turn_max_tokens = (
+            (pre_turn_tokens + max_tokens) if max_tokens is not None else None
+        )
+
         if decompose:
             result = run_decomposed_retrieval(
                 effective_query, root, chat_fn,
                 link_index=link_index, on_event=_on_event,
+                max_tokens=turn_max_tokens, tracker=tracker,
             )
         else:
             result = run_retrieval(
                 effective_query, root, chat_fn,
                 link_index=link_index, on_event=_on_event, history=history,
+                max_tokens=turn_max_tokens, tracker=tracker,
             )
 
         elapsed = time.time() - start
@@ -1084,10 +1127,21 @@ def chat(
             for cited in result.cited_nodes:
                 console.print(f"  • {cited}")
 
-        console.print(
-            f"[dim]turn={turn}  iterations={result.iterations_used}  "
-            f"elapsed={elapsed:.1f}s[/]\n"
-        )
+        # v0.9: per-turn usage report.
+        if tracker is not None:
+            delta_tokens = tracker.total_tokens - pre_turn_tokens
+            delta_calls = tracker.total_calls - pre_turn_calls
+            console.print(
+                f"[dim]turn={turn}  iterations={result.iterations_used}  "
+                f"elapsed={elapsed:.1f}s  "
+                f"tokens={delta_tokens:,} ({delta_calls} calls)  "
+                f"cumulative={tracker.total_tokens:,}[/]\n"
+            )
+        else:
+            console.print(
+                f"[dim]turn={turn}  iterations={result.iterations_used}  "
+                f"elapsed={elapsed:.1f}s[/]\n"
+            )
 
         # Append to conversation history.
         history.append((query, result.answer[:500]))
@@ -1101,6 +1155,31 @@ def chat(
             elapsed_seconds=elapsed,
         )
         write_log(vault / folder, record)
+
+    # v0.9: print cumulative usage summary on exit.
+    if tracker is not None and tracker.total_calls > 0:
+        usage_table = Table(title="Chat Session Token Usage (v0.9)")
+        usage_table.add_column("Phase", style="bold")
+        usage_table.add_column("Calls", justify="right")
+        usage_table.add_column("Prompt", justify="right")
+        usage_table.add_column("Completion", justify="right")
+        usage_table.add_column("Elapsed (s)", justify="right")
+        for phase, bucket in sorted(tracker.by_phase().items()):
+            usage_table.add_row(
+                phase,
+                str(int(bucket["calls"])),
+                f"{int(bucket['prompt']):,}",
+                f"{int(bucket['completion']):,}",
+                f"{bucket['elapsed']:.1f}",
+            )
+        usage_table.add_row(
+            "[bold]TOTAL",
+            str(tracker.total_calls),
+            f"[bold]{tracker.total_prompt_tokens:,}",
+            f"[bold]{tracker.total_completion_tokens:,}",
+            f"[bold]{tracker.total_elapsed:.1f}",
+        )
+        console.print(usage_table)
 
 
 @main.command()
@@ -1175,7 +1254,12 @@ def serve(
     )
     console.print("[dim]Warming up: scanning + summarizing...[/]")
 
-    chat_fn = _make_chat_fn(model, num_ctx)
+    # v0.9: wire a cumulative UsageTracker into the server's chat_fn
+    # so /usage endpoint can report real token counts.
+    from .usage import UsageTracker
+
+    tracker = UsageTracker()
+    chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker)
 
     try:
         state = build_initial_state(
@@ -1189,6 +1273,9 @@ def serve(
     except Exception as e:
         console.print(f"[red]Failed to build initial state: {e}[/]")
         sys.exit(1)
+
+    # Attach the same tracker to state so HTTP handlers can read it.
+    state.tracker = tracker
 
     note_count = sum(1 for n in state.root.walk() if n.kind == "note")
     console.print(f"[dim]Ready! {note_count} notes loaded. Press Ctrl+C to stop.[/]")

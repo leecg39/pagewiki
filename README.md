@@ -94,6 +94,13 @@ pagewiki serve --vault ~/Research --folder Research --port 8000
 # 이후:
 # curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json' \
 #   -d '{"query": "What is attention?"}'
+# curl http://localhost:8000/usage   # 누적 토큰 사용량 (v0.9+)
+
+# 토큰 예산 한도 (v0.9+): 쿼리당 토큰 하드 캡
+pagewiki ask "query" --max-tokens 50000 --usage
+
+# Chat 세션 usage 집계 (v0.9+)
+pagewiki chat --usage --max-tokens 30000
 
 # LLM-Wiki 컴파일 (v0.3+): entity 추출 → 위키 페이지 자동 생성
 pagewiki compile --folder Research             # → {vault}/LLM-Wiki/
@@ -137,7 +144,8 @@ pagewiki ask "query" --vault "~/Documents/Obsidian Vault" --model ollama/gemma4:
 - v0.5: Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile 실행, Settings 탭, 결과 모달
 - v0.6: 대화형 `chat` 모드, atomic summary 디스크 캐시, YAML frontmatter 필터 (`--tag`/`--after`/`--before`), 실시간 스트리밍 출력
 - v0.7: 병렬 LLM 호출 (`--max-workers`), 멀티쿼리 분해 (`--decompose`), 멀티 vault 검색 (`--extra-vault`), HTTP API 서버 (`pagewiki serve`)
-- **v0.8 (현재)**: 토큰 사용량 추적 (`--usage`), SELECT 파싱 실패 시 자동 재시도, BM25 기반 후보 사전 랭킹, 서버 엔드포인트 테스트
+- v0.8: 토큰 사용량 추적 (`--usage`), SELECT 파싱 실패 시 자동 재시도, BM25 기반 후보 사전 랭킹, 서버 엔드포인트 테스트
+- **v0.9 (현재)**: 토큰 예산 한도 (`--max-tokens`), chat 세션 usage 집계, 서버 `/usage` 엔드포인트, cited note BM25 재정렬
 
 ## Obsidian 플러그인 (v0.6)
 

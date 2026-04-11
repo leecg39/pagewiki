@@ -90,7 +90,7 @@ class TestHealthEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
-        assert data["version"] == "0.7.0"
+        assert data["version"] == "0.9.0"
         assert data["note_count"] == 2
         assert data["active_sessions"] == 0
 
