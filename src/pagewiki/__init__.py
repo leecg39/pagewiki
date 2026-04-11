@@ -1,3 +1,3 @@
 """pagewiki — Vectorless reasoning-based RAG for Obsidian vaults."""
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"

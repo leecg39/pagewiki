@@ -170,14 +170,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
 <main>
   <div class="card">
-    <textarea id="query" rows="4" placeholder="질문을 입력하세요..."></textarea>
+    <textarea id="query" rows="4"
+              placeholder="질문을 입력하세요... (Cmd/Ctrl+Enter 전송, Esc 취소)"></textarea>
     <div class="row">
       <label><input type="checkbox" id="decompose"> Decompose</label>
       <label><input type="checkbox" id="jsonMode"> JSON mode</label>
       <label><input type="checkbox" id="reuseContext"> Reuse context</label>
       <div style="flex:1"></div>
-      <button id="askBtn">Ask</button>
-      <button id="cancelBtn" class="danger" disabled>Cancel</button>
+      <button id="askBtn" title="Cmd/Ctrl+Enter">Ask</button>
+      <button id="cancelBtn" class="danger" disabled title="Esc">Cancel</button>
     </div>
   </div>
 
@@ -261,6 +262,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       runQuery();
+    }
+  });
+  // v0.18: Esc cancels a running query from anywhere on the page.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && abortController) {
+      abortController.abort();
+      statusEl.textContent = "cancelled";
     }
   });
 
