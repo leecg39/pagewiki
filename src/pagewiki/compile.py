@@ -36,6 +36,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,8 @@ from pathlib import Path
 from .tree import TreeNode
 
 ChatFn = Callable[[str], str]
+
+DEFAULT_MAX_WORKERS = 4
 
 WIKI_DIRNAME = "LLM-Wiki"
 INDEX_FILENAME = "index.md"
@@ -163,13 +166,19 @@ def parse_entities(response: str) -> list[tuple[str, str, str]]:
 def extract_entities_from_tree(
     root: TreeNode,
     chat_fn: ChatFn,
+    *,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> dict[str, Entity]:
     """Pass 1: extract entities from every note in the tree.
 
     Returns a dict keyed by normalized entity name (lowercase).
-    """
-    entities: dict[str, Entity] = {}
 
+    LLM calls are dispatched in parallel via a ``ThreadPoolExecutor``
+    (v0.7). Results are aggregated sequentially after all workers
+    finish to keep the entity dict deterministic.
+    """
+    # Phase 1: collect (node, content) tuples for every processable note.
+    targets: list[tuple[TreeNode, str]] = []
     for node in root.walk():
         if node.kind != "note":
             continue
@@ -180,10 +189,27 @@ def extract_entities_from_tree(
         if not content.strip():
             continue
 
+        targets.append((node, content))
+
+    if not targets:
+        return {}
+
+    def _extract_one(item: tuple[TreeNode, str]) -> tuple[TreeNode, list[tuple[str, str, str]]]:
+        node, content = item
         prompt = _extract_entities_prompt(node.title, content)
         response = chat_fn(prompt)
-        parsed = parse_entities(response)
+        return node, parse_entities(response)
 
+    # Phase 2: parallel LLM dispatch.
+    if max_workers <= 1 or len(targets) == 1:
+        results = [_extract_one(item) for item in targets]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(_extract_one, targets))
+
+    # Phase 3: aggregate entities sequentially (order-preserving).
+    entities: dict[str, Entity] = {}
+    for node, parsed in results:
         for name, category, description in parsed:
             key = name.strip().lower()
             if key not in entities:
@@ -202,26 +228,40 @@ def extract_entities_from_tree(
 def generate_wiki_pages(
     entities: dict[str, Entity],
     chat_fn: ChatFn,
+    *,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> dict[str, str]:
     """Pass 2: generate a wiki page for each entity.
 
     Returns a dict of ``{filename: markdown_content}``.
+
+    Wiki-page generation is parallelized (v0.7) since each entity
+    page is independent. Filename sanitization happens after results
+    are collected to keep the dict deterministic.
     """
     all_names = [e.name for e in entities.values()]
-    pages: dict[str, str] = {}
+    targets = [e for e in entities.values() if e.mentions]
 
-    for entity in entities.values():
-        if not entity.mentions:
-            continue
+    if not targets:
+        return {}
 
+    def _generate_one(entity: Entity) -> tuple[Entity, str]:
         prompt = _generate_page_prompt(
             entity.name,
             entity.category,
             entity.mentions,
             all_names,
         )
-        page_content = chat_fn(prompt).strip()
-        # Sanitize filename: replace spaces with hyphens, remove special chars
+        return entity, chat_fn(prompt).strip()
+
+    if max_workers <= 1 or len(targets) == 1:
+        results = [_generate_one(e) for e in targets]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(_generate_one, targets))
+
+    pages: dict[str, str] = {}
+    for entity, page_content in results:
         safe_name = re.sub(r"[^\w\s-]", "", entity.name).strip()
         safe_name = re.sub(r"\s+", "-", safe_name)
         filename = f"{safe_name}.md"
@@ -419,6 +459,7 @@ def compile_wiki(
     chat_fn: ChatFn,
     *,
     subfolder: str | None = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> Path:
     """Run the full two-pass compilation and write to ``{vault}/LLM-Wiki/``.
 
@@ -427,6 +468,7 @@ def compile_wiki(
         vault_root: Path to the Obsidian vault root.
         chat_fn: LLM callable.
         subfolder: Optional subfolder name (for scoped compilation).
+        max_workers: Parallel LLM workers for extraction + page generation.
 
     Returns:
         Path to the generated LLM-Wiki directory.
@@ -445,7 +487,7 @@ def compile_wiki(
             root, chat_fn, cached_mtimes, cached_entities
         )
     else:
-        entities = extract_entities_from_tree(root, chat_fn)
+        entities = extract_entities_from_tree(root, chat_fn, max_workers=max_workers)
         note_mtimes = {}
         for node in root.walk():
             if node.kind == "note" and node.file_path and node.file_path.exists():
@@ -463,7 +505,7 @@ def compile_wiki(
         return wiki_dir
 
     # Pass 2: generate pages
-    pages = generate_wiki_pages(entities, chat_fn)
+    pages = generate_wiki_pages(entities, chat_fn, max_workers=max_workers)
 
     # Write entity pages
     for filename, content in pages.items():

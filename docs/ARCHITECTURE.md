@@ -150,6 +150,10 @@ pagewiki/
 │   ├── obsidian_config.py    # 볼트 자동 발견 (notesmd-cli / obsidian.json)
 │   ├── ollama_client.py      # LiteLLM + Ollama 래퍼
 │   ├── logger.py             # QueryRecord → .pagewiki-log
+│   ├── server.py             # FastAPI HTTP 서버 (v0.7, optional)
+│   ├── usage.py              # 토큰 사용량 추적 (v0.8)
+│   ├── usage_store.py        # SQLite usage 영속화 (v0.10)
+│   ├── ranking.py            # BM25-style 후보 사전 랭킹 (v0.8)
 │   └── _vendor/pageindex/    # 번들된 PageIndex SDK (MIT)
 ├── obsidian-plugin/
 │   ├── main.ts               # Obsidian 플러그인 (Scan/Ask/Chat/Compile/Watch)
@@ -203,8 +207,13 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.3 | Karpathy LLM-Wiki compiler — `pagewiki compile` 서브커맨드, 2-pass 파이프라인 (entity 추출 → 위키 페이지 생성), `{vault}/LLM-Wiki/` 출력 |
 | v0.4 | 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 vault 파일 변경 실시간 감지 |
 | v0.5 | Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile/Watch 실행, Settings 탭, 결과 모달 |
-| **v0.6** (현재) | **대화형 모드 + 캐시 + 필터 + 스트리밍** — 아래 §7.1 상세 |
-| v0.7 (계획) | 병렬 LLM + 멀티쿼리 분해 + API 서버 — 아래 §7.2 상세 |
+| v0.6 | 대화형 모드 + 캐시 + 필터 + 스트리밍 — 아래 §7.1 상세 |
+| v0.7 | 병렬 LLM + 멀티쿼리 분해 + 멀티 vault + API 서버 — 아래 §7.2 상세 |
+| v0.8 | 토큰 사용량 추적 + 파싱 재시도 + BM25 사전 랭킹 — 아래 §7.3 상세 |
+| v0.9 | 토큰 예산 + chat usage + /usage endpoint + cited 재정렬 — 아래 §7.4 상세 |
+| v0.10 | JSON-mode + SQLite usage + SSE 스트리밍 + context reuse — 아래 §7.5 상세 |
+| v0.11 | /chat/stream + usage 이벤트 + per-vault 캐시 + usage-report CLI — 아래 §7.6 상세 |
+| **v0.12** (현재) | **WebSocket + daily 롤업 + cross-vault + 플러그인 server-mode** — 아래 §7.7 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -215,26 +224,81 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | Frontmatter 필터 | frontmatter.py, vault.py `filter_tree()` | YAML frontmatter(tags, date, aliases) 파싱 → TreeNode 필드. `--tag`/`--after`/`--before` CLI 옵션으로 트리 사전 가지치기 |
 | 실시간 스트리밍 | retrieval.py `on_event`, cli.py | `run_retrieval()`에 `EventCallback` 추가. SELECT/EVAL/XREF/DONE 단계를 실시간 표시 |
 
-### 7.2 v0.7 계획
+### 7.2 v0.7 상세
 
-**병렬 LLM 호출** (high impact):
-- 현재 `summarize_atomic_notes()`와 `compile` 파이프라인은 노트당 1회 순차 LLM 호출
-- `concurrent.futures.ThreadPoolExecutor`로 병렬화 (Ollama는 동시 요청 지원)
-- 예상 효과: 50 ATOMIC 노트 요약 시간 50x → 5x 수준으로 단축
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| 병렬 LLM 호출 | vault.py, compile.py | `summarize_atomic_notes()`와 `extract_entities_from_tree()`/`generate_wiki_pages()`를 `ThreadPoolExecutor`로 병렬화. `--max-workers`로 동시 worker 수 조정 (기본 4). Ollama는 동시 요청 지원. |
+| 멀티쿼리 분해 | retrieval.py `run_decomposed_retrieval`, prompts.py | `--decompose` 플래그 활성 시 LLM으로 복합 질문을 서브쿼리로 분해 → 각각 retrieve → synthesize. `SINGLE` 응답 시 단일 쿼리 경로로 fall-through. |
+| 멀티 vault 검색 | vault.py `scan_multi_vault()`, cli.py `--extra-vault` | 여러 볼트를 가상 루트 아래 병합. 각 노드의 `node_id`는 `<vault_name>::`로 네임스페이스 prefix. 캐시는 abs_path 기반이라 볼트 간 충돌 없음. |
+| HTTP API 서버 | server.py, cli.py `serve` | FastAPI 기반 `pagewiki serve`. 트리/캐시 startup warmup → `/health`, `/scan`, `/ask`, `/chat`(세션 관리) 엔드포인트. FastAPI는 `pip install 'pagewiki[server]'`로 선택적 설치. |
 
-**멀티쿼리 분해** (medium impact):
-- 복합 질문을 LLM으로 서브쿼리로 분해 → 각각 `run_retrieval()` → 결과 합성
-- "X와 Y의 차이점은?" → Sub-Q1: "X란?", Sub-Q2: "Y란?", Sub-Q3: "차이점 비교"
+**API 서버 엔드포인트**:
 
-**API 서버 모드** (medium impact, high effort):
-- FastAPI 기반 `pagewiki serve` 명령
-- `POST /ask`, `POST /chat` 엔드포인트 + 세션 관리
-- 트리/캐시를 서버 기동 시 1회 로드 → 반복 쿼리 시 스캔 오버헤드 제거
+```
+GET    /health          # liveness + note count
+POST   /scan            # refresh in-memory tree
+POST   /ask             # single-shot query (decompose/filter 지원)
+POST   /chat            # session-based multi-turn (session_id 자동 발급)
+DELETE /chat/{sid}      # 세션 삭제
+```
 
-**멀티 vault 지원** (medium impact, high effort):
-- `--vault` 복수 지정 또는 `--vault-all` 옵션
-- 각 vault의 TreeNode를 가상 루트 아래 병합
-- `node_id`에 vault 네임스페이스 추가 (충돌 방지)
+세션은 in-process dict로 관리, 1시간 비활성 시 자동 만료.
+
+### 7.3 v0.8 상세
+
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| 토큰 사용량 추적 | usage.py `UsageTracker` | 스레드 안전 counter. `chat_fn` 래퍼가 매 호출을 phase(summarize/select/evaluate/final/...)별로 기록. `ask --usage`로 terminal에 Rich 테이블 출력. |
+| 파싱 재시도 | prompts.py `build_retry_prompt`, retrieval.py | SELECT 응답이 malformed일 때 stricter format reminder를 append해 한 번 더 시도. 기존에는 loop가 즉시 abort됐지만 이제 자동 복구. |
+| BM25 사전 랭킹 | ranking.py | Zero-LLM 비용의 candidate 사전 정렬. 토큰 overlap 기반 BM25-style 스코어 + 짧은 후보 보너스. 정렬된 목록을 SELECT 프롬프트에 전달 → LLM이 적은 iteration으로 정답 도달. Korean/English 혼용 vault 지원. |
+| 서버 엔드포인트 테스트 | tests/test_server.py | FastAPI `TestClient` 기반 11개 테스트. /health, /scan, /ask, /chat (세션 생성/누적/삭제/만료) 검증. FastAPI 미설치 시 `pytest.importorskip`로 clean skip. |
+
+### 7.4 v0.9 상세
+
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| 토큰 예산 한도 | retrieval.py `run_retrieval`, `run_decomposed_retrieval` | 새 `max_tokens` + `tracker` 매개변수. 매 iteration 시작 전에 `tracker.total_tokens >= max_tokens`를 검사하고 초과 시 루프를 clean abort. 초과 상태에서 answer 합성 비용까지 아끼기 위해 final answer도 raw 근거 concat으로 fall back. CLI `ask --max-tokens N`, `chat --max-tokens N` (per-turn 예산). |
+| Chat 세션 usage | cli.py `chat` | `UsageTracker`가 세션 전체에 걸쳐 cumulative 집계. 매 turn마다 pre-turn snapshot과 delta를 비교해 per-turn 토큰 + call 수를 표시. 종료 시 phase별 Rich 테이블 출력. `--max-tokens`는 per-turn 예산 (세션 누적이 아님). |
+| Server `/usage` | server.py `GET /usage`, `POST /usage/reset` | `ServerState.tracker`가 서버 lifetime 동안 모든 LLM 호출 누적. FastAPI 엔드포인트로 cumulative counts + phase 분해 반환. reset 엔드포인트로 모니터링 윈도우 초기화 가능. |
+| Cited note 재정렬 | retrieval.py + ranking.py | `gathered` 목록을 `rank_candidates`로 쿼리 관련도 순으로 재정렬해 `cited_nodes`가 discovery order가 아닌 relevance order로 반환. Zero-LLM 비용 (기존 BM25 스코어러 재사용). |
+
+### 7.5 v0.10 상세
+
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| JSON-mode | prompts.py `select_node_prompt_json` / `evaluate_prompt_json` + `parse_*_response_json` | LLM이 `{"action": "SELECT", "node_id": "..."}` 형식의 JSON 객체로 응답. 파서는 markdown code fence + 앞뒤 noise tolerant. `run_retrieval(json_mode=True)` 혹은 `ask --json-mode`. JSON retry가 실패하면 v0.8 text parser로 자동 fall-back. |
+| SQLite usage 영속화 | usage_store.py `UsageStore` | SQLite `usage_events` 테이블 (timestamp, phase, prompt, completion, elapsed). WAL 모드 + phase/timestamp 인덱스. `query_summary(since, until)` for 집계. `pagewiki serve --usage-db PATH`로 활성화. `/usage` 엔드포인트가 `persistent_total_*` 필드 추가. |
+| SSE 스트리밍 | server.py `POST /ask/stream` | `fastapi.StreamingResponse`로 SSE 이벤트 반환. `trace` 이벤트 (TraceStep당 하나) → `answer` 이벤트 (최종 답변 + cited). 동기 retrieval loop을 `threading.Thread` + `queue.Queue`로 async generator에 bridge. |
+| Context reuse | retrieval.py `shown_ids` + `reuse_context` | 각 iteration에서 후보 목록에 등장한 모든 node_id를 추적. `reuse_context=True`일 때 이후 iteration에서는 이미 보여준 후보를 자동 제거 → 프롬프트 길이 감소. path_so_far가 3단계 넘으면 `...(생략)` 프리픽스로 truncate. CLI `ask --reuse-context`. |
+
+### 7.6 v0.11 상세
+
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| `/chat/stream` SSE | server.py `_stream_retrieval` + `chat_stream` | `/ask/stream`과 같은 threading + queue 패턴을 공유하는 헬퍼로 통합. `ChatSession` 히스토리가 `run_retrieval(history=...)`로 전달. 종료 이벤트에 `session_id`, `turn` 포함. 세션은 서버 state에서 관리, 1시간 비활성 시 만료. |
+| Usage 이벤트 SSE | server.py `_stream_retrieval` | 각 trace step 직후 `event: usage` 프레임을 emit. per-request `UsageTracker`로 cumulative counts를 계산해 `{total_calls, prompt_tokens, completion_tokens, total_tokens, elapsed}` JSON 반환. 클라이언트가 실시간 토큰 미터 표시 가능. |
+| Per-vault 캐시 | vault.py `vault_for_note`, `build_long_subtrees_multi`, `summarize_atomic_notes_multi` | 멀티 vault에서 각 노트의 `file_path`로 소속 vault를 찾아 해당 vault의 `TreeCache`/`SummaryCache`에 기록. 기존에는 primary vault의 `.pagewiki-cache/`로 통합되던 것을 vault별로 분리. longest-match 라우팅으로 중첩 vault도 올바르게 처리. |
+| `pagewiki usage-report` | cli.py `usage_report` 커맨드 | SQLite 사용량 DB 조회 CLI. `--since`/`--until`/`--phase`/`--recent` 필터. phase별 breakdown Rich 테이블 + 최근 이벤트 리스트. `serve --usage-db`와 페어링. |
+| compile 토큰 추적 | cli.py `compile` | `--usage`/`--usage-db` 플래그 추가. `_make_chat_fn`에 tracker + store 주입해 entity extraction/page generation 양쪽 phase의 토큰 사용량 집계. |
+| Obsidian plugin v0.10 catch-up | obsidian-plugin/main.ts | 누락됐던 v0.8~v0.10 flag (`--usage`, `--max-tokens`, `--json-mode`, `--reuse-context`) 모두 설정 탭 + runAsk/ChatModal에 연결. |
+
+### 7.7 v0.12 상세
+
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| WebSocket `/ask/ws` | server.py `ask_ws` | FastAPI WebSocket 엔드포인트. 양방향 메시지 프로토콜 (`ask`/`cancel`/`ping`). 서버는 `trace`/`usage`/`answer`/`cancelled`/`error`/`pong` 전송. 클라이언트가 `cancel`을 보내면 `threading.Event`로 retrieval loop에 신호 → 다음 iteration 시작 전 `should_stop` 콜백이 확인하고 clean abort. |
+| `should_stop` 콜백 | retrieval.py | `run_retrieval`에 `should_stop: Callable[[], bool] | None` 파라미터 추가. 매 iteration 시작 전 호출되어 True 반환 시 loop abort → `TraceStep("cancel", ...)` emit. WebSocket 외에도 임의 interrupt 구현 가능. |
+| Daily 롤업 | usage_store.py `rollup_day`, `rollup_range`, `query_daily`, `usage_daily` 테이블 | 대용량 usage DB에서 날짜별 집계 쿼리 가속. `rollup_day(date)`가 하루 분량을 pre-aggregate → `usage_daily` 테이블에 JSON phase breakdown 저장. `rollup_range(since, until)`로 범위 일괄 처리. `usage-report --daily`로 CLI 노출. 빈 날짜도 zero row를 한 번만 기록해 idempotent. |
+| Cross-vault retrieval | retrieval.py `run_cross_vault_retrieval` | 멀티 vault를 하나의 가상 루트로 merge하는 대신 **각 vault에서 독립적으로 full retrieval 실행 → 결과 synthesize**. 각 vault의 wiki-link 인덱스가 스코프 유지되어 spurious cross-vault 링크 해결 방지. `cited_nodes`는 `<vault_name>::` 프리픽스로 attribution. CLI `ask --per-vault` (멀티 vault 시에만 의미). |
+| 플러그인 server-mode | obsidian-plugin/main.ts `streamSSE`, `_runAskServerMode`, `_submitServerMode` | 새 `serverUrl` 설정이 비어있지 않으면 `fetch('/ask/stream')` 또는 `/chat/stream`로 직접 POST하고 SSE를 파싱. Node.js `ReadableStream` + 프레임 분리기로 `trace`/`usage`/`answer` 이벤트 처리. ChatModal은 live placeholder를 mutate해 스트리밍 중 진행 표시. session_id 자동 유지로 후속 질문이 서버-side history 활용. |
+
+### 7.8 v0.13+ 향후 계획
+
+- 플러그인에서 WebSocket 직접 소비 (cancel 버튼)
+- Usage DB에 rolling retention (오래된 raw events 삭제 후 rollup만 유지)
+- Cross-vault + decompose 조합
+- `run_retrieval`의 budget 분배 정책 (summarize vs retrieve 비율 tuning)
 
 ## 8. 명시적 비목표 (Non-Goals)
 

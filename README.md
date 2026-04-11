@@ -80,6 +80,56 @@ pagewiki chat --folder Research
 pagewiki ask "attention 메커니즘 비교" --tag research --after 2024-01
 pagewiki chat --tag ml --before 2025-06
 
+# 멀티쿼리 분해 (v0.7+): 복합 질문을 서브쿼리로 분해 후 종합
+pagewiki ask "Transformer와 RNN의 차이점과 장단점은?" --decompose
+
+# 병렬 LLM 호출 (v0.7+): ATOMIC 노트 요약 병렬화
+pagewiki ask "query" --max-workers 8
+
+# 멀티 vault 검색 (v0.7+): 여러 볼트 동시 검색
+pagewiki ask "query" --vault ~/Research --extra-vault ~/Work --extra-vault ~/Personal
+
+# HTTP API 서버 (v0.7+): 트리를 메모리에 warm 유지, 반복 쿼리 가속
+pagewiki serve --vault ~/Research --folder Research --port 8000
+# 이후:
+# curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json' \
+#   -d '{"query": "What is attention?"}'
+# curl http://localhost:8000/usage   # 누적 토큰 사용량 (v0.9+)
+
+# 토큰 예산 한도 (v0.9+): 쿼리당 토큰 하드 캡
+pagewiki ask "query" --max-tokens 50000 --usage
+
+# Chat 세션 usage 집계 (v0.9+)
+pagewiki chat --usage --max-tokens 30000
+
+# JSON-mode + 컨텍스트 재사용 (v0.10+)
+pagewiki ask "query" --json-mode --reuse-context
+
+# 서버 + SQLite usage 영속화 (v0.10+)
+pagewiki serve --vault ~/Research --usage-db ~/.pagewiki/usage.db --port 8000
+# 이후 curl http://localhost:8000/usage → persistent_total_* 필드 포함
+# SSE 스트리밍: curl -N -X POST http://localhost:8000/ask/stream \
+#   -H 'Content-Type: application/json' -d '{"query": "..."}' 하면
+# trace/usage/answer 이벤트가 실시간으로 흘러나옴
+# v0.11: /chat/stream은 session_id로 대화 컨텍스트 유지
+
+# Usage 리포트 (v0.11+): SQLite DB에서 누적 사용량 조회
+pagewiki usage-report --db ~/.pagewiki/usage.db
+pagewiki usage-report --db ~/.pagewiki/usage.db --since 2024-11-01 --phase select --recent 10
+
+# Daily 롤업 (v0.12+): 대용량 DB에서 날짜별 집계 가속
+pagewiki usage-report --db ~/.pagewiki/usage.db --daily --since 2024-11-01
+
+# compile 토큰 추적 (v0.11+)
+pagewiki compile --folder Research --usage --usage-db ~/.pagewiki/usage.db
+
+# Cross-vault retrieval (v0.12+): 각 vault를 독립적으로 탐색 후 합성
+pagewiki ask "query" --vault ~/Research --extra-vault ~/Work --per-vault
+
+# WebSocket 양방향 스트리밍 (v0.12+): 진행 중 interrupt 가능
+# ws://localhost:8000/ask/ws 로 접속해 {"type":"ask","query":"..."} 전송,
+# 진행 중 {"type":"cancel"} 보내면 루프 즉시 중단
+
 # LLM-Wiki 컴파일 (v0.3+): entity 추출 → 위키 페이지 자동 생성
 pagewiki compile --folder Research             # → {vault}/LLM-Wiki/
 
@@ -120,8 +170,13 @@ pagewiki ask "query" --vault "~/Documents/Obsidian Vault" --model ollama/gemma4:
 - v0.3: Karpathy LLM-Wiki compiler — `pagewiki compile`로 entity 추출 → 위키 페이지 자동 생성 → `{vault}/LLM-Wiki/`에 교차참조된 위키 출력
 - v0.4: 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 파일 변경 실시간 감지
 - v0.5: Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile 실행, Settings 탭, 결과 모달
-- **v0.6 (현재)**: 대화형 `chat` 모드, atomic summary 디스크 캐시, YAML frontmatter 필터 (`--tag`/`--after`/`--before`), 실시간 스트리밍 출력
-- v0.7 (계획): 병렬 LLM 호출, 멀티쿼리 분해, API 서버 모드, 멀티 vault 지원
+- v0.6: 대화형 `chat` 모드, atomic summary 디스크 캐시, YAML frontmatter 필터 (`--tag`/`--after`/`--before`), 실시간 스트리밍 출력
+- v0.7: 병렬 LLM 호출 (`--max-workers`), 멀티쿼리 분해 (`--decompose`), 멀티 vault 검색 (`--extra-vault`), HTTP API 서버 (`pagewiki serve`)
+- v0.8: 토큰 사용량 추적 (`--usage`), SELECT 파싱 실패 시 자동 재시도, BM25 기반 후보 사전 랭킹, 서버 엔드포인트 테스트
+- v0.9: 토큰 예산 한도 (`--max-tokens`), chat 세션 usage 집계, 서버 `/usage` 엔드포인트, cited note BM25 재정렬
+- v0.10: JSON-mode 프롬프트 (`--json-mode`), SQLite usage 영속화 (`serve --usage-db`), SSE 스트리밍 (`POST /ask/stream`), 컨텍스트 reuse (`--reuse-context`)
+- v0.11: `POST /chat/stream` SSE + 라이브 usage 이벤트, 멀티 vault per-vault 캐시 분리, `pagewiki usage-report` 명령, compile 토큰 추적, Obsidian 플러그인 v0.10 flags
+- **v0.12 (현재)**: WebSocket `/ask/ws` (양방향, cancel 지원), daily usage 롤업 (`usage-report --daily`), cross-vault retrieval (`--per-vault`), Obsidian 플러그인 server-mode (SSE 직접 소비)
 
 ## Obsidian 플러그인 (v0.6)
 

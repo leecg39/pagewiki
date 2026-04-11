@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .cache import SummaryCache, TreeCache
@@ -24,6 +25,11 @@ from .prompts import atomic_summary_prompt
 from .tree import NoteTier, TreeNode
 
 ChatFn = Callable[[str], str]
+
+# Default parallel worker count for LLM calls.
+# Ollama can serve concurrent requests but too many in parallel can
+# thrash VRAM. 4 is a safe default for 24GB VRAM machines.
+DEFAULT_MAX_WORKERS = 4
 
 # Heuristic: 1 token ≈ 4 chars for English, ≈ 2 chars for Korean.
 # Use the conservative English ratio; real tokenization happens in PageIndex.
@@ -129,12 +135,17 @@ def summarize_atomic_notes(
     skip_existing: bool = True,
     summary_cache: SummaryCache | None = None,
     model_id: str | None = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> int:
     """Fill in one-line summaries for every tier=ATOMIC note under `root`.
 
     Walks the Layer 1 tree and calls `chat_fn` once per ATOMIC note. MICRO
     notes are skipped (title-only is fine) and LONG notes are handled by
     the PageIndex adapter, so they're skipped here too.
+
+    LLM calls are dispatched in parallel via a ``ThreadPoolExecutor``
+    (v0.7). Ollama serves concurrent requests, so this gives a
+    near-linear speedup up to the worker count.
 
     Args:
         root: Layer 1 tree root.
@@ -146,11 +157,14 @@ def summarize_atomic_notes(
             redundant LLM calls on repeated ``ask`` invocations.
         model_id: LLM model identifier, required when ``summary_cache``
             is provided (part of the cache key).
+        max_workers: Number of concurrent LLM calls. Default 4.
+            Set to 1 to force strictly sequential execution.
 
     Returns:
         Number of notes actually summarized (i.e. LLM calls made).
     """
-    calls = 0
+    # Phase 1: collect work items (and apply cache hits synchronously).
+    pending: list[TreeNode] = []
     for node in root.walk():
         if node.kind != "note" or node.tier != NoteTier.ATOMIC:
             continue
@@ -166,19 +180,32 @@ def summarize_atomic_notes(
                 node.summary = cached
                 continue
 
+        pending.append(node)
+
+    if not pending:
+        return 0
+
+    def _summarize_one(node: TreeNode) -> tuple[TreeNode, str]:
+        assert node.file_path is not None
         content = node.file_path.read_text(encoding="utf-8")
         prompt = atomic_summary_prompt(node.title, content)
-        summary = chat_fn(prompt).strip()
-        # Strip quotes if the model wrapped its answer
-        summary = summary.strip("\"'").strip()
-        node.summary = summary
-        calls += 1
+        summary = chat_fn(prompt).strip().strip("\"'").strip()
+        return node, summary
 
-        # Persist to cache for next run.
-        if summary_cache is not None and model_id is not None:
+    # Phase 2: parallel LLM dispatch.
+    if max_workers <= 1 or len(pending) == 1:
+        results = [_summarize_one(n) for n in pending]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(_summarize_one, pending))
+
+    # Phase 3: apply results and persist to cache (single-threaded).
+    for node, summary in results:
+        node.summary = summary
+        if summary_cache is not None and model_id is not None and node.file_path:
             summary_cache.save(node.file_path, model_id, summary)
 
-    return calls
+    return len(results)
 
 
 def build_long_subtrees(
@@ -252,6 +279,225 @@ def build_long_subtrees(
             built += 1
 
     return built, from_cache
+
+
+def scan_multi_vault(
+    vaults: list[tuple[Path, str | None]],
+) -> TreeNode:
+    """Scan multiple vault/subfolder pairs into a single merged tree (v0.7).
+
+    Each vault becomes a top-level folder under a virtual root, with
+    the vault directory name (or a resolved name) as the folder title.
+    Node ids are prefixed with ``<vault_name>::`` so the same file path
+    in different vaults stays distinguishable in the retrieval loop's
+    ``visited_ids`` set.
+
+    Args:
+        vaults: List of ``(vault_path, subfolder)`` tuples. ``subfolder``
+            may be ``None`` to scan the whole vault.
+
+    Returns:
+        A synthetic folder TreeNode whose children are the per-vault
+        scans. If only one vault is passed, returns its root directly.
+    """
+    if not vaults:
+        raise ValueError("scan_multi_vault requires at least one vault")
+
+    if len(vaults) == 1:
+        vault_path, subfolder = vaults[0]
+        return scan_folder(vault_path, subfolder)
+
+    multi_root = TreeNode(
+        node_id="",
+        title="<multi-vault>",
+        kind="folder",
+    )
+
+    for vault_path, subfolder in vaults:
+        vault_root = scan_folder(vault_path, subfolder)
+        vault_name = vault_path.name or "vault"
+
+        # Re-tag every descendant's node_id with the vault namespace so
+        # a note with the same relative path in another vault does not
+        # collide in visited_ids / citation lookups.
+        prefix = f"{vault_name}::"
+        for node in vault_root.walk():
+            if node.node_id:
+                node.node_id = f"{prefix}{node.node_id}"
+
+        # Wrap the vault scan under a labeled folder so the LLM's
+        # ToC review sees "research-vault" / "work-vault" as siblings.
+        wrapper = TreeNode(
+            node_id=prefix.rstrip(":"),
+            title=vault_name,
+            kind="folder",
+            children=list(vault_root.children) if vault_root.kind == "folder" else [vault_root],
+        )
+        multi_root.children.append(wrapper)
+
+    return multi_root
+
+
+def vault_for_note(note_path: Path, vault_roots: list[Path]) -> Path | None:
+    """Return the vault root whose directory contains ``note_path``.
+
+    Used in multi-vault mode (v0.11) so each note's cache entry
+    lands in the right vault's ``.pagewiki-cache/`` directory
+    instead of all pooling into the primary vault. Returns
+    ``None`` if no vault matches (defensive — caller should fall
+    back to the primary vault in that case).
+    """
+    try:
+        abs_note = note_path.expanduser().resolve()
+    except OSError:
+        return None
+
+    best_match: Path | None = None
+    best_len = -1
+    for vault in vault_roots:
+        try:
+            abs_vault = vault.expanduser().resolve()
+        except OSError:
+            continue
+        try:
+            abs_note.relative_to(abs_vault)
+        except ValueError:
+            continue
+        vlen = len(str(abs_vault))
+        if vlen > best_len:
+            best_match = vault
+            best_len = vlen
+    return best_match
+
+
+def build_long_subtrees_multi(
+    root: TreeNode,
+    *,
+    vault_roots: list[Path],
+    model_id: str,
+    chat_fn: ChatFn | None = None,
+    caches: dict[Path, TreeCache] | None = None,
+) -> tuple[int, int]:
+    """Multi-vault aware version of ``build_long_subtrees`` (v0.11).
+
+    Each LONG note is routed to the ``TreeCache`` of its owning
+    vault (determined by ``vault_for_note``). If no per-vault cache
+    is supplied for a note's vault, one is created lazily.
+
+    Falls back to the primary vault's cache for notes outside any
+    configured vault directory.
+    """
+    if caches is None:
+        caches = {}
+    for v in vault_roots:
+        if v not in caches:
+            caches[v] = TreeCache(v)
+
+    primary = vault_roots[0]
+    built = 0
+    from_cache = 0
+
+    for node in root.walk():
+        if node.kind != "note" or node.tier != NoteTier.LONG:
+            continue
+        if node.file_path is None:
+            continue
+
+        owning_vault = vault_for_note(node.file_path, vault_roots) or primary
+        cache = caches[owning_vault]
+
+        node_path = node.file_path
+        node_title = node.title
+        node_prefix = node.node_id
+
+        def _build(
+            _path=node_path, _title=node_title, _prefix=node_prefix
+        ) -> list[TreeNode]:
+            return build_long_note_subtree(
+                _path,
+                _title,
+                chat_fn=chat_fn,
+                node_id_prefix=_prefix,
+            )
+
+        children, hit = cache.load_or_build(node.file_path, model_id, _build)
+        node.children = children
+        if hit:
+            from_cache += 1
+        else:
+            built += 1
+
+    return built, from_cache
+
+
+def summarize_atomic_notes_multi(
+    root: TreeNode,
+    chat_fn: ChatFn,
+    *,
+    vault_roots: list[Path],
+    model_id: str,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    skip_existing: bool = True,
+    summary_caches: dict[Path, SummaryCache] | None = None,
+) -> int:
+    """Multi-vault aware summarize_atomic_notes (v0.11).
+
+    Routes each note's summary cache lookup/write to its owning
+    vault's ``SummaryCache`` instance.
+    """
+    if summary_caches is None:
+        summary_caches = {}
+    for v in vault_roots:
+        if v not in summary_caches:
+            summary_caches[v] = SummaryCache(v)
+
+    primary = vault_roots[0]
+
+    # Phase 1: cache hits first, remaining notes deferred.
+    pending: list[tuple[TreeNode, SummaryCache]] = []
+    for node in root.walk():
+        if node.kind != "note" or node.tier != NoteTier.ATOMIC:
+            continue
+        if skip_existing and node.summary:
+            continue
+        if node.file_path is None:
+            continue
+
+        owning_vault = vault_for_note(node.file_path, vault_roots) or primary
+        cache = summary_caches[owning_vault]
+
+        cached = cache.load(node.file_path, model_id)
+        if cached is not None:
+            node.summary = cached
+            continue
+
+        pending.append((node, cache))
+
+    if not pending:
+        return 0
+
+    def _summarize_one(
+        item: tuple[TreeNode, SummaryCache],
+    ) -> tuple[TreeNode, SummaryCache, str]:
+        node, cache = item
+        assert node.file_path is not None
+        content = node.file_path.read_text(encoding="utf-8")
+        prompt = atomic_summary_prompt(node.title, content)
+        summary = chat_fn(prompt).strip().strip("\"'").strip()
+        return node, cache, summary
+
+    if max_workers <= 1 or len(pending) == 1:
+        results = [_summarize_one(item) for item in pending]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(_summarize_one, pending))
+
+    for node, cache, summary in results:
+        node.summary = summary
+        if node.file_path is not None:
+            cache.save(node.file_path, model_id, summary)
+
+    return len(results)
 
 
 def filter_tree(

@@ -22,21 +22,50 @@ from .cache import SummaryCache, TreeCache
 from .logger import QueryRecord, write_log
 from .retrieval import run_retrieval
 from .tree import NoteTier
-from .vault import build_long_subtrees, filter_tree, scan_folder, summarize_atomic_notes
+from .vault import (
+    build_long_subtrees,
+    build_long_subtrees_multi,
+    filter_tree,
+    scan_folder,
+    scan_multi_vault,
+    summarize_atomic_notes,
+    summarize_atomic_notes_multi,
+)
 
 console = Console()
 
 
-def _make_chat_fn(model: str, num_ctx: int):
+def _make_chat_fn(model: str, num_ctx: int, tracker=None, usage_store=None):
     """Build a chat_fn closure bound to a specific Ollama model.
 
     Imported lazily so `pagewiki scan` works even when LiteLLM / Ollama are
     not installed locally.
+
+    When ``tracker`` is provided, every call is recorded with real
+    prompt/completion token counts from LiteLLM (v0.8). When
+    ``usage_store`` is additionally provided, events are also
+    persisted to a SQLite file (v0.10).
     """
     from .ollama_client import chat
 
+    if tracker is None and usage_store is None:
+        def _call(prompt: str) -> str:
+            return chat(prompt, model=model, num_ctx=num_ctx).text
+        return _call
+
+    import time as _time
+
     def _call(prompt: str) -> str:
-        return chat(prompt, model=model, num_ctx=num_ctx).text
+        t0 = _time.time()
+        response = chat(prompt, model=model, num_ctx=num_ctx)
+        elapsed = _time.time() - t0
+        prompt_tokens = response.prompt_tokens or 0
+        completion_tokens = response.completion_tokens or 0
+        if tracker is not None:
+            tracker.record("other", prompt_tokens, completion_tokens, elapsed)
+        if usage_store is not None:
+            usage_store.record("other", prompt_tokens, completion_tokens, elapsed)
+        return response.text
 
     return _call
 
@@ -193,6 +222,33 @@ def _open_cited_notes(
             subprocess.run(argv, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as e:
             console.print(f"  [red]Failed: {e}[/]")
+
+
+def _resolve_multi_vault(
+    vaults: tuple[Path, ...],
+    fallback: Path | None,
+) -> list[Path]:
+    """Return a list of resolved vault paths.
+
+    If ``vaults`` is empty, falls back to auto-discovery (same as
+    ``_resolve_vault``). Otherwise returns the explicit list, keeping
+    order and deduplicating by resolved absolute path.
+    """
+    if not vaults:
+        return [_resolve_vault(fallback)]
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for v in vaults:
+        try:
+            abs_path = v.expanduser().resolve()
+        except OSError:
+            abs_path = v
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        resolved.append(v)
+    return resolved
 
 
 def _resolve_vault(vault: Path | None) -> Path:
@@ -403,11 +459,30 @@ def vaults() -> None:
 @click.option(
     "--num-ctx", default=131072, type=int, help="Ollama context window."
 )
+@click.option(
+    "--max-workers", default=4, type=int,
+    help="Parallel LLM workers for entity extraction + page generation.",
+)
+@click.option(
+    "--usage",
+    is_flag=True,
+    help="Print token usage breakdown at the end of compilation (v0.11).",
+)
+@click.option(
+    "--usage-db",
+    "usage_db",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Persist usage events to a SQLite database (v0.11).",
+)
 def compile(
     vault: Path | None,
     folder: str | None,
     model: str,
     num_ctx: int,
+    max_workers: int,
+    usage: bool,
+    usage_db: Path | None,
 ) -> None:
     """Compile vault notes into an LLM-Wiki (entity pages + index).
 
@@ -429,10 +504,25 @@ def compile(
         console.print("[red]No notes found to compile.[/]")
         sys.exit(1)
 
-    console.print(f"[dim]Found {note_count} notes to process...[/]")
+    console.print(
+        f"[dim]Found {note_count} notes to process (parallel: {max_workers})...[/]"
+    )
 
-    chat_fn = _make_chat_fn(model, num_ctx)
-    wiki_dir = compile_wiki(root, vault, chat_fn, subfolder=folder)
+    # v0.11: optional usage tracking + persistence for compile.
+    from .usage import UsageTracker
+
+    tracker = UsageTracker() if (usage or usage_db is not None) else None
+    store = None
+    if usage_db is not None:
+        from .usage_store import UsageStore
+
+        store = UsageStore(usage_db)
+        console.print(f"[dim]Usage persistence: {usage_db}[/]")
+
+    chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker, usage_store=store)
+    wiki_dir = compile_wiki(
+        root, vault, chat_fn, subfolder=folder, max_workers=max_workers,
+    )
 
     # Count generated files
     generated = list(wiki_dir.glob("*.md"))
@@ -441,6 +531,31 @@ def compile(
         f"{len(generated)} pages written to {wiki_dir}"
     )
     console.print("[dim]Open in Obsidian: index.md is the entry point.[/]")
+
+    if tracker is not None and tracker.total_calls > 0:
+        usage_table = Table(title="Compile Token Usage (v0.11)")
+        usage_table.add_column("Phase", style="bold")
+        usage_table.add_column("Calls", justify="right")
+        usage_table.add_column("Prompt", justify="right")
+        usage_table.add_column("Completion", justify="right")
+        usage_table.add_column("Elapsed (s)", justify="right")
+        for phase, bucket in sorted(tracker.by_phase().items()):
+            usage_table.add_row(
+                phase,
+                str(int(bucket["calls"])),
+                f"{int(bucket['prompt']):,}",
+                f"{int(bucket['completion']):,}",
+                f"{bucket['elapsed']:.1f}",
+            )
+        usage_table.add_row(
+            "[bold]TOTAL",
+            str(tracker.total_calls),
+            f"[bold]{tracker.total_prompt_tokens:,}",
+            f"[bold]{tracker.total_completion_tokens:,}",
+            f"[bold]{tracker.total_elapsed:.1f}",
+        )
+        console.print()
+        console.print(usage_table)
 
 
 @main.command()
@@ -553,6 +668,13 @@ def watch(
     "notesmd-cli or obsidian.json.",
 )
 @click.option(
+    "--extra-vault",
+    "extra_vaults",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Additional vault paths for multi-vault search (v0.7, repeatable).",
+)
+@click.option(
     "--folder", default="Research", help="Subfolder inside the vault. Default: Research"
 )
 @click.option(
@@ -590,9 +712,51 @@ def watch(
     default=None,
     help="Only consider notes with date <= this value. E.g. --before 2025-06",
 )
+@click.option(
+    "--max-workers",
+    default=4,
+    type=int,
+    help="Parallel LLM workers for summarization. Default: 4. Set to 1 for sequential.",
+)
+@click.option(
+    "--decompose",
+    is_flag=True,
+    help="Decompose complex queries into sub-questions and synthesize answers (v0.7).",
+)
+@click.option(
+    "--usage",
+    is_flag=True,
+    help="Print token usage breakdown at the end of the query (v0.8).",
+)
+@click.option(
+    "--max-tokens",
+    "max_tokens",
+    default=None,
+    type=int,
+    help="Hard cap on total tokens for this query. Loop aborts when exceeded (v0.9).",
+)
+@click.option(
+    "--json-mode",
+    "json_mode",
+    is_flag=True,
+    help="Use JSON-schema prompts + parser for SELECT/EVALUATE (v0.10).",
+)
+@click.option(
+    "--reuse-context",
+    "reuse_context",
+    is_flag=True,
+    help="Compact path_so_far + suppress already-shown candidates (v0.10).",
+)
+@click.option(
+    "--per-vault",
+    "per_vault",
+    is_flag=True,
+    help="Run retrieval independently per vault then synthesize (v0.12).",
+)
 def ask(
     query: str,
     vault: Path | None,
+    extra_vaults: tuple[Path, ...],
     folder: str,
     model: str,
     num_ctx: int,
@@ -601,18 +765,54 @@ def ask(
     filter_tags: tuple[str, ...],
     filter_after: str | None,
     filter_before: str | None,
+    max_workers: int,
+    decompose: bool,
+    usage: bool,
+    max_tokens: int | None,
+    json_mode: bool,
+    reuse_context: bool,
+    per_vault: bool,
 ) -> None:
-    """Run a multi-hop reasoning query against a vault folder."""
-    vault = _resolve_vault(vault)
+    """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
-    console.print(f"  vault={vault}  folder={folder}  model={model}\n")
+
+    # Resolve the primary vault and collect any --extra-vault paths.
+    primary = _resolve_vault(vault)
+    all_vaults: list[Path] = [primary]
+    for extra in extra_vaults:
+        try:
+            abs_extra = extra.expanduser().resolve()
+        except OSError:
+            abs_extra = extra
+        if abs_extra not in [v.resolve() for v in all_vaults]:
+            all_vaults.append(extra)
+
+    multi_vault = len(all_vaults) > 1
+    if multi_vault:
+        vault_list = ", ".join(str(v) for v in all_vaults)
+        console.print(f"  vaults=[{vault_list}]  folder={folder}  model={model}\n")
+    else:
+        console.print(f"  vault={primary}  folder={folder}  model={model}\n")
+
+    # Keep a single canonical vault for cache / log paths.
+    vault = primary
 
     start = time.time()
-    chat_fn = _make_chat_fn(model, num_ctx)
 
-    # Step 1: scan
-    console.print("[dim]1/4 Scanning vault...[/]")
-    root = scan_folder(vault, folder)
+    # v0.8: optional token usage tracking (v0.9: also auto-enabled
+    # when --max-tokens is set, since budget enforcement needs a
+    # tracker to compare against).
+    from .usage import UsageTracker
+    tracker = UsageTracker() if (usage or max_tokens is not None) else None
+    chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker)
+
+    # Step 1: scan (multi-vault aware)
+    if multi_vault:
+        console.print(f"[dim]1/4 Scanning {len(all_vaults)} vaults...[/]")
+        root = scan_multi_vault([(v, folder) for v in all_vaults])
+    else:
+        console.print("[dim]1/4 Scanning vault...[/]")
+        root = scan_folder(vault, folder)
 
     # Apply frontmatter filters (v0.6).
     active_filters = list(filter_tags) or None
@@ -638,13 +838,25 @@ def ask(
         console.print(f"[red]No notes found in {vault / folder}[/]")
         sys.exit(1)
 
-    # Step 2: summarize atomic notes (optional, with on-disk cache)
+    # Step 2: summarize atomic notes (optional, cached, parallel in v0.7,
+    # per-vault cache routing in v0.11).
     if not skip_summaries:
-        console.print("[dim]2/4 Summarizing atomic notes...[/]")
-        scache = SummaryCache(vault)
-        summarized = summarize_atomic_notes(
-            root, chat_fn, summary_cache=scache, model_id=model,
+        console.print(
+            f"[dim]2/4 Summarizing atomic notes (parallel: {max_workers} workers)...[/]"
         )
+        if multi_vault:
+            summarized = summarize_atomic_notes_multi(
+                root, chat_fn,
+                vault_roots=all_vaults,
+                model_id=model,
+                max_workers=max_workers,
+            )
+        else:
+            scache = SummaryCache(vault)
+            summarized = summarize_atomic_notes(
+                root, chat_fn, summary_cache=scache, model_id=model,
+                max_workers=max_workers,
+            )
         console.print(f"[dim]    → {summarized} notes summarized (rest from cache)[/]")
     else:
         console.print("[dim]2/4 Skipping summarization (--skip-summaries)[/]")
@@ -655,13 +867,21 @@ def ask(
             f"[dim]3/4 Building PageIndex sub-trees for {long_count} LONG notes...[/]"
         )
         section_chat_fn = None if skip_summaries else chat_fn
-        built, from_cache = build_long_subtrees(
-            root,
-            vault_root=vault,
-            model_id=model,
-            chat_fn=section_chat_fn,
-            cache=TreeCache(vault),
-        )
+        if multi_vault:
+            built, from_cache = build_long_subtrees_multi(
+                root,
+                vault_roots=all_vaults,
+                model_id=model,
+                chat_fn=section_chat_fn,
+            )
+        else:
+            built, from_cache = build_long_subtrees(
+                root,
+                vault_root=vault,
+                model_id=model,
+                chat_fn=section_chat_fn,
+                cache=TreeCache(vault),
+            )
         console.print(f"[dim]    → {built} built, {from_cache} from cache[/]")
     else:
         console.print("[dim]3/4 No LONG notes — skipping sub-tree build[/]")
@@ -671,16 +891,24 @@ def ask(
 
     link_index = build_link_index(root)
 
-    # Step 4: retrieval loop with live streaming (v0.6)
-    console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
+    # Step 4: retrieval loop with live streaming (v0.6 streaming + v0.7 decomposition)
+    if decompose:
+        console.print("[dim]4/4 Running decomposed multi-hop retrieval...[/]\n")
+    else:
+        console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
 
-    from .retrieval import TraceStep
+    from .retrieval import TraceStep, run_cross_vault_retrieval, run_decomposed_retrieval
 
     _phase_icons = {
         "select": "[cyan]SELECT[/]",
         "evaluate": "[yellow]EVAL[/]",
         "cross-ref": "[magenta]XREF[/]",
         "finalize": "[green]DONE[/]",
+        "decompose": "[blue]DECOMP[/]",
+        "reuse": "[dim]REUSE[/]",
+        "budget": "[red]BUDGET[/]",
+        "cross-vault": "[bold blue]VAULT[/]",
+        "cancel": "[red]CANCEL[/]",
     }
 
     def _on_event(step: TraceStep) -> None:
@@ -688,9 +916,67 @@ def ask(
         node_part = f" [{escape(step.node_id)}]" if step.node_id else ""
         console.print(f"  {icon}{node_part} {escape(step.detail)}")
 
-    result = run_retrieval(
-        query, root, chat_fn, link_index=link_index, on_event=_on_event,
-    )
+    if per_vault and multi_vault:
+        # v0.12: rescan each vault into an isolated root so run_cross_vault_retrieval
+        # can attribute results per vault. Re-uses the caches already warmed above.
+        console.print(
+            f"[dim]4/4 Running per-vault retrieval "
+            f"across {len(all_vaults)} vaults...[/]\n"
+        )
+        per_vault_roots = []
+        per_vault_labels = []
+        per_vault_indexes = []
+        for v in all_vaults:
+            v_root = scan_folder(v, folder)
+            if active_filters or filter_after or filter_before:
+                v_root = filter_tree(
+                    v_root, tags=active_filters,
+                    after=filter_after, before=filter_before,
+                )
+            # Reuse summary cache since we already warmed it.
+            if not skip_summaries:
+                summarize_atomic_notes(
+                    v_root, chat_fn,
+                    summary_cache=SummaryCache(v),
+                    model_id=model,
+                    max_workers=max_workers,
+                )
+            v_long = sum(
+                1 for n in v_root.walk()
+                if n.kind == "note" and n.tier == NoteTier.LONG
+            )
+            if v_long > 0:
+                build_long_subtrees(
+                    v_root, vault_root=v, model_id=model,
+                    chat_fn=(None if skip_summaries else chat_fn),
+                    cache=TreeCache(v),
+                )
+            per_vault_roots.append(v_root)
+            per_vault_labels.append(v.name)
+            per_vault_indexes.append(build_link_index(v_root))
+
+        result = run_cross_vault_retrieval(
+            query, per_vault_roots, chat_fn,
+            link_indexes=per_vault_indexes,
+            vault_labels=per_vault_labels,
+            on_event=_on_event,
+            max_tokens=max_tokens, tracker=tracker,
+            json_mode=json_mode, reuse_context=reuse_context,
+        )
+    elif decompose:
+        result = run_decomposed_retrieval(
+            query, root, chat_fn,
+            link_index=link_index, on_event=_on_event,
+            max_tokens=max_tokens, tracker=tracker,
+            json_mode=json_mode, reuse_context=reuse_context,
+        )
+    else:
+        result = run_retrieval(
+            query, root, chat_fn,
+            link_index=link_index, on_event=_on_event,
+            max_tokens=max_tokens, tracker=tracker,
+            json_mode=json_mode, reuse_context=reuse_context,
+        )
 
     elapsed = time.time() - start
 
@@ -709,6 +995,33 @@ def ask(
     console.print(
         f"\n[dim]iterations={result.iterations_used}  elapsed={elapsed:.1f}s[/]"
     )
+
+    # v0.8: print usage summary if tracking is enabled.
+    if tracker is not None and tracker.total_calls > 0:
+        usage_table = Table(title="Token Usage (v0.8)")
+        usage_table.add_column("Phase", style="bold")
+        usage_table.add_column("Calls", justify="right")
+        usage_table.add_column("Prompt", justify="right")
+        usage_table.add_column("Completion", justify="right")
+        usage_table.add_column("Elapsed (s)", justify="right")
+
+        for phase, bucket in sorted(tracker.by_phase().items()):
+            usage_table.add_row(
+                phase,
+                str(int(bucket["calls"])),
+                f"{int(bucket['prompt']):,}",
+                f"{int(bucket['completion']):,}",
+                f"{bucket['elapsed']:.1f}",
+            )
+        usage_table.add_row(
+            "[bold]TOTAL",
+            str(tracker.total_calls),
+            f"[bold]{tracker.total_prompt_tokens:,}",
+            f"[bold]{tracker.total_completion_tokens:,}",
+            f"[bold]{tracker.total_elapsed:.1f}",
+        )
+        console.print()
+        console.print(usage_table)
 
     record = QueryRecord(
         query=query,
@@ -729,6 +1042,13 @@ def ask(
     help="Obsidian vault root.",
 )
 @click.option(
+    "--extra-vault",
+    "extra_vaults",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Additional vault paths for multi-vault search (v0.7, repeatable).",
+)
+@click.option(
     "--folder", default="Research", help="Subfolder inside the vault. Default: Research",
 )
 @click.option("--model", default="ollama/gemma4:26b", help="LiteLLM model id.")
@@ -744,8 +1064,28 @@ def ask(
 )
 @click.option("--after", "filter_after", default=None, help="Notes with date >= value.")
 @click.option("--before", "filter_before", default=None, help="Notes with date <= value.")
+@click.option(
+    "--max-workers", default=4, type=int,
+    help="Parallel LLM workers. Default: 4.",
+)
+@click.option(
+    "--decompose", is_flag=True,
+    help="Decompose complex queries into sub-questions (v0.7).",
+)
+@click.option(
+    "--usage", is_flag=True,
+    help="Print cumulative token usage after each turn (v0.9).",
+)
+@click.option(
+    "--max-tokens",
+    "max_tokens",
+    default=None,
+    type=int,
+    help="Per-turn token budget. Each chat turn aborts if exceeded (v0.9).",
+)
 def chat(
     vault: Path | None,
+    extra_vaults: tuple[Path, ...],
     folder: str,
     model: str,
     num_ctx: int,
@@ -753,6 +1093,10 @@ def chat(
     filter_tags: tuple[str, ...],
     filter_after: str | None,
     filter_before: str | None,
+    max_workers: int,
+    decompose: bool,
+    usage: bool,
+    max_tokens: int | None,
 ) -> None:
     """Interactive multi-turn conversation against a vault folder.
 
@@ -762,23 +1106,50 @@ def chat(
     """
     from .prompts import rewrite_query_with_context
     from .retrieval import TraceStep as _TraceStep
+    from .retrieval import run_decomposed_retrieval
+    from .usage import UsageTracker
     from .wiki_links import build_link_index
 
-    vault = _resolve_vault(vault)
+    # Resolve primary + extra vaults for multi-vault support (v0.7).
+    primary = _resolve_vault(vault)
+    all_vaults: list[Path] = [primary]
+    for extra in extra_vaults:
+        try:
+            abs_extra = extra.expanduser().resolve()
+        except OSError:
+            abs_extra = extra
+        if abs_extra not in [v.resolve() for v in all_vaults]:
+            all_vaults.append(extra)
+
+    multi_vault = len(all_vaults) > 1
+    vault = primary
+    vault_str = (
+        f"{len(all_vaults)} vaults: " + ", ".join(v.name for v in all_vaults)
+        if multi_vault
+        else str(vault)
+    )
+
     console.print(
         Panel(
             f"[bold cyan]pagewiki chat[/] — interactive mode\n"
-            f"vault={vault}  folder={folder}  model={model}\n"
+            f"{'vaults' if multi_vault else 'vault'}={vault_str}  "
+            f"folder={folder}  model={model}\n"
             f"Type [bold]quit[/] to exit, [bold]/clear[/] to reset history.",
-            title="pagewiki v0.6",
+            title="pagewiki v0.7",
         )
     )
 
-    chat_fn = _make_chat_fn(model, num_ctx)
+    # v0.9: tracker is cumulative across the whole chat session.
+    # Auto-enabled when --max-tokens is set even without --usage.
+    tracker = UsageTracker() if (usage or max_tokens is not None) else None
+    chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker)
 
     # Pre-scan once so repeated queries reuse the same tree.
     console.print("[dim]Scanning vault...[/]")
-    root = scan_folder(vault, folder)
+    if multi_vault:
+        root = scan_multi_vault([(v, folder) for v in all_vaults])
+    else:
+        root = scan_folder(vault, folder)
 
     # Apply filters.
     active_filters = list(filter_tags) or None
@@ -792,12 +1163,15 @@ def chat(
         console.print(f"[red]No notes found in {vault / folder}[/]")
         sys.exit(1)
 
-    # Summarize atomic notes (cached).
+    # Summarize atomic notes (cached, parallel in v0.7).
     if not skip_summaries:
-        console.print("[dim]Summarizing atomic notes...[/]")
+        console.print(
+            f"[dim]Summarizing atomic notes (parallel: {max_workers})...[/]"
+        )
         scache = SummaryCache(vault)
         summarized = summarize_atomic_notes(
             root, chat_fn, summary_cache=scache, model_id=model,
+            max_workers=max_workers,
         )
         console.print(f"[dim]  → {summarized} summarized (rest from cache)[/]")
 
@@ -825,6 +1199,9 @@ def chat(
         "evaluate": "[yellow]EVAL[/]",
         "cross-ref": "[magenta]XREF[/]",
         "finalize": "[green]DONE[/]",
+        "decompose": "[blue]DECOMP[/]",
+        "reuse": "[dim]REUSE[/]",
+        "budget": "[red]BUDGET[/]",
     }
 
     def _on_event(step: _TraceStep) -> None:
@@ -854,6 +1231,10 @@ def chat(
         turn += 1
         start = time.time()
 
+        # v0.9: snapshot pre-turn usage so we can compute this turn's delta.
+        pre_turn_tokens = tracker.total_tokens if tracker is not None else 0
+        pre_turn_calls = tracker.total_calls if tracker is not None else 0
+
         # Rewrite follow-up queries into standalone form.
         effective_query = query
         if history:
@@ -862,10 +1243,24 @@ def chat(
                 console.print(f"[dim]  → rewritten: {rewritten}[/]")
                 effective_query = rewritten
 
-        result = run_retrieval(
-            effective_query, root, chat_fn,
-            link_index=link_index, on_event=_on_event, history=history,
+        # v0.9: per-turn budget tracked against pre_turn_tokens snapshot.
+        # When --max-tokens is set, each turn gets its own allowance.
+        turn_max_tokens = (
+            (pre_turn_tokens + max_tokens) if max_tokens is not None else None
         )
+
+        if decompose:
+            result = run_decomposed_retrieval(
+                effective_query, root, chat_fn,
+                link_index=link_index, on_event=_on_event,
+                max_tokens=turn_max_tokens, tracker=tracker,
+            )
+        else:
+            result = run_retrieval(
+                effective_query, root, chat_fn,
+                link_index=link_index, on_event=_on_event, history=history,
+                max_tokens=turn_max_tokens, tracker=tracker,
+            )
 
         elapsed = time.time() - start
 
@@ -876,10 +1271,21 @@ def chat(
             for cited in result.cited_nodes:
                 console.print(f"  • {cited}")
 
-        console.print(
-            f"[dim]turn={turn}  iterations={result.iterations_used}  "
-            f"elapsed={elapsed:.1f}s[/]\n"
-        )
+        # v0.9: per-turn usage report.
+        if tracker is not None:
+            delta_tokens = tracker.total_tokens - pre_turn_tokens
+            delta_calls = tracker.total_calls - pre_turn_calls
+            console.print(
+                f"[dim]turn={turn}  iterations={result.iterations_used}  "
+                f"elapsed={elapsed:.1f}s  "
+                f"tokens={delta_tokens:,} ({delta_calls} calls)  "
+                f"cumulative={tracker.total_tokens:,}[/]\n"
+            )
+        else:
+            console.print(
+                f"[dim]turn={turn}  iterations={result.iterations_used}  "
+                f"elapsed={elapsed:.1f}s[/]\n"
+            )
 
         # Append to conversation history.
         history.append((query, result.answer[:500]))
@@ -893,6 +1299,311 @@ def chat(
             elapsed_seconds=elapsed,
         )
         write_log(vault / folder, record)
+
+    # v0.9: print cumulative usage summary on exit.
+    if tracker is not None and tracker.total_calls > 0:
+        usage_table = Table(title="Chat Session Token Usage (v0.9)")
+        usage_table.add_column("Phase", style="bold")
+        usage_table.add_column("Calls", justify="right")
+        usage_table.add_column("Prompt", justify="right")
+        usage_table.add_column("Completion", justify="right")
+        usage_table.add_column("Elapsed (s)", justify="right")
+        for phase, bucket in sorted(tracker.by_phase().items()):
+            usage_table.add_row(
+                phase,
+                str(int(bucket["calls"])),
+                f"{int(bucket['prompt']):,}",
+                f"{int(bucket['completion']):,}",
+                f"{bucket['elapsed']:.1f}",
+            )
+        usage_table.add_row(
+            "[bold]TOTAL",
+            str(tracker.total_calls),
+            f"[bold]{tracker.total_prompt_tokens:,}",
+            f"[bold]{tracker.total_completion_tokens:,}",
+            f"[bold]{tracker.total_elapsed:.1f}",
+        )
+        console.print(usage_table)
+
+
+@main.command()
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root.",
+)
+@click.option(
+    "--extra-vault",
+    "extra_vaults",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Additional vault paths for multi-vault search.",
+)
+@click.option(
+    "--folder", default=None, help="Subfolder inside the vault.",
+)
+@click.option("--model", default="ollama/gemma4:26b", help="LiteLLM model id.")
+@click.option("--num-ctx", default=131072, type=int, help="Ollama context window.")
+@click.option(
+    "--max-workers", default=4, type=int, help="Parallel LLM workers.",
+)
+@click.option("--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1")
+@click.option("--port", default=8000, type=int, help="Bind port. Default: 8000")
+@click.option(
+    "--usage-db",
+    "usage_db",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Optional SQLite path for persistent usage tracking (v0.10).",
+)
+def serve(
+    vault: Path | None,
+    extra_vaults: tuple[Path, ...],
+    folder: str | None,
+    model: str,
+    num_ctx: int,
+    max_workers: int,
+    host: str,
+    port: int,
+    usage_db: Path | None,
+) -> None:
+    """Run pagewiki as an HTTP API server (v0.7).
+
+    Scans the vault once at startup, keeps the tree warm in memory,
+    and exposes /health, /scan, /ask, /chat endpoints. Chat sessions
+    maintain conversation history server-side.
+
+    Requires the optional ``server`` extra:
+        pip install 'pagewiki[server]'
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        console.print(
+            "[red]uvicorn is not installed.[/]\n"
+            "Install the server extra:\n"
+            "    pip install 'pagewiki[server]'"
+        )
+        sys.exit(1)
+
+    from .server import build_initial_state, create_app
+
+    # Resolve primary + extra vaults.
+    primary = _resolve_vault(vault)
+    all_vaults: list[Path] = [primary]
+    for extra in extra_vaults:
+        try:
+            abs_extra = extra.expanduser().resolve()
+        except OSError:
+            abs_extra = extra
+        if abs_extra not in [v.resolve() for v in all_vaults]:
+            all_vaults.append(extra)
+
+    console.print(f"[bold cyan]Starting pagewiki server[/] on http://{host}:{port}")
+    console.print(
+        f"  vaults={len(all_vaults)}  folder={folder}  model={model}"
+    )
+    console.print("[dim]Warming up: scanning + summarizing...[/]")
+
+    # v0.9: cumulative UsageTracker. v0.10: optional UsageStore.
+    from .usage import UsageTracker
+
+    tracker = UsageTracker()
+
+    usage_store = None
+    if usage_db is not None:
+        from .usage_store import UsageStore
+
+        usage_store = UsageStore(usage_db)
+        console.print(f"[dim]Usage persistence: {usage_db}[/]")
+
+    chat_fn = _make_chat_fn(
+        model, num_ctx, tracker=tracker, usage_store=usage_store,
+    )
+
+    try:
+        state = build_initial_state(
+            all_vaults,
+            folder=folder,
+            model=model,
+            num_ctx=num_ctx,
+            max_workers=max_workers,
+            chat_fn=chat_fn,
+        )
+    except Exception as e:
+        console.print(f"[red]Failed to build initial state: {e}[/]")
+        sys.exit(1)
+
+    # Attach the same tracker + store to state so HTTP handlers can read them.
+    state.tracker = tracker
+    state.usage_store = usage_store
+
+    note_count = sum(1 for n in state.root.walk() if n.kind == "note")
+    console.print(f"[dim]Ready! {note_count} notes loaded. Press Ctrl+C to stop.[/]")
+
+    app = create_app(state)
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+@main.command("usage-report")
+@click.option(
+    "--db",
+    "db_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to the SQLite usage database (written by `serve --usage-db`).",
+)
+@click.option(
+    "--since",
+    default=None,
+    help="Only include events newer than this ISO date (e.g. 2024-11-01).",
+)
+@click.option(
+    "--until",
+    default=None,
+    help="Only include events older than this ISO date.",
+)
+@click.option(
+    "--phase",
+    default=None,
+    help="Filter to a single phase (select/evaluate/final/...).",
+)
+@click.option(
+    "--recent",
+    default=0,
+    type=int,
+    help="Also print the N most recent events as a detail list.",
+)
+@click.option(
+    "--daily",
+    is_flag=True,
+    help="Rollup and print daily aggregates (v0.12).",
+)
+def usage_report(
+    db_path: Path,
+    since: str | None,
+    until: str | None,
+    phase: str | None,
+    recent: int,
+    daily: bool,
+) -> None:
+    """Query a SQLite usage database and print a Rich breakdown (v0.11).
+
+    Pair with ``pagewiki serve --usage-db PATH`` which persists every
+    LLM call into the same database. Useful for daily/weekly token
+    cost audits, cost attribution by phase, and trend analysis
+    across many sessions.
+    """
+    from datetime import datetime
+
+    from .usage_store import UsageStore
+
+    def _parse_iso(s: str | None) -> float | None:
+        if s is None:
+            return None
+        # Accept bare dates or full ISO timestamps.
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            console.print(f"[red]Invalid ISO timestamp: {s}[/]")
+            sys.exit(1)
+        return dt.timestamp()
+
+    since_ts = _parse_iso(since)
+    until_ts = _parse_iso(until)
+
+    store = UsageStore(db_path)
+    summary = store.query_summary(since=since_ts, until=until_ts)
+
+    title_parts = [f"Usage Report ({db_path.name})"]
+    if since:
+        title_parts.append(f"since={since}")
+    if until:
+        title_parts.append(f"until={until}")
+    if phase:
+        title_parts.append(f"phase={phase}")
+
+    console.print(f"[bold cyan]{' | '.join(title_parts)}[/]")
+    console.print(
+        f"[dim]total_calls={summary.total_calls:,}  "
+        f"prompt={summary.total_prompt:,}  "
+        f"completion={summary.total_completion:,}  "
+        f"elapsed={summary.total_elapsed:.1f}s[/]\n"
+    )
+
+    if summary.total_calls == 0:
+        console.print("[yellow]No events match the filter.[/]")
+        return
+
+    by_phase_items = summary.by_phase.items()
+    if phase:
+        by_phase_items = [(p, b) for p, b in by_phase_items if p == phase]
+
+    table = Table(title="By Phase")
+    table.add_column("Phase", style="bold")
+    table.add_column("Calls", justify="right")
+    table.add_column("Prompt", justify="right")
+    table.add_column("Completion", justify="right")
+    table.add_column("Elapsed (s)", justify="right")
+    for p, b in sorted(by_phase_items):
+        table.add_row(
+            p,
+            f"{int(b['calls']):,}",
+            f"{int(b['prompt']):,}",
+            f"{int(b['completion']):,}",
+            f"{float(b['elapsed']):.1f}",
+        )
+    console.print(table)
+
+    if recent > 0:
+        events = store.query_events(
+            since=since_ts,
+            until=until_ts,
+            phase=phase,
+            limit=recent,
+        )
+        if events:
+            console.print(f"\n[bold]Most recent {len(events)} events:[/]")
+            for e in events:
+                ts = datetime.fromtimestamp(e.timestamp).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                console.print(
+                    f"  [dim]{ts}[/] [cyan]{e.phase:<10}[/] "
+                    f"p={e.prompt:,} c={e.completion:,} "
+                    f"({e.elapsed:.1f}s)"
+                )
+
+    if daily:
+        # Rollup any missing days and then query the table for display.
+        # ``since``/``until`` here are ISO date strings (rollup_range
+        # uses date.fromisoformat) rather than datetime timestamps.
+        written = store.rollup_range(since=since, until=until)
+        rows = store.query_daily(since=since, until=until)
+        if rows:
+            daily_table = Table(
+                title=f"Daily Rollup (rolled {written} new days)"
+            )
+            daily_table.add_column("Date", style="bold")
+            daily_table.add_column("Calls", justify="right")
+            daily_table.add_column("Prompt", justify="right")
+            daily_table.add_column("Completion", justify="right")
+            daily_table.add_column("Elapsed (s)", justify="right")
+            for row in rows:
+                daily_table.add_row(
+                    row["date"],
+                    f"{row['total_calls']:,}",
+                    f"{row['total_prompt']:,}",
+                    f"{row['total_completion']:,}",
+                    f"{row['total_elapsed']:.1f}",
+                )
+            console.print()
+            console.print(daily_table)
+        else:
+            console.print("\n[dim]No daily rollup rows in range.[/]")
+
+    store.close()
 
 
 if __name__ == "__main__":
