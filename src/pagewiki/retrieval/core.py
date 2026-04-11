@@ -32,6 +32,14 @@ from ..prompts import (
     select_node_prompt_json,
     select_node_user_prompt,
 )
+from ..prompts_en import (
+    EN_EVALUATE_SYSTEM,
+    EN_FINAL_ANSWER_SYSTEM,
+    EN_SELECT_NODE_SYSTEM,
+    evaluate_prompt_en,
+    final_answer_prompt_en,
+    select_node_prompt_en,
+)
 from ..tree import TreeNode
 from ..wiki_links import LinkIndex, build_link_index
 from .helpers import _load_note_content, _node_as_summary, _promote_to_note
@@ -65,6 +73,7 @@ def run_retrieval(
     reuse_context: bool = False,
     should_stop: Callable[[], bool] | None = None,
     system_chat_fn: SystemChatFn | None = None,
+    lang: str = "ko",
 ) -> RetrievalResult:
     """Run the multi-hop reasoning loop.
 
@@ -85,6 +94,11 @@ def run_retrieval(
     applies to the plain-text code path.
     """
     use_prompt_cache = system_chat_fn is not None
+    use_en = (lang or "ko").lower() == "en"
+    # Pick language-appropriate system constants for the prompt-cache path.
+    active_select_system = EN_SELECT_NODE_SYSTEM if use_en else SELECT_NODE_SYSTEM
+    active_evaluate_system = EN_EVALUATE_SYSTEM if use_en else EVALUATE_SYSTEM
+    active_final_system = EN_FINAL_ANSWER_SYSTEM if use_en else FINAL_ANSWER_SYSTEM
     trace: list[TraceStep] = []
 
     def _record(step: TraceStep) -> None:
@@ -200,7 +214,13 @@ def run_retrieval(
         elif use_prompt_cache:
             # v0.14 prompt caching: send the stable SELECT system
             # preamble separately so Ollama can reuse its KV cache.
+            # Prompt cache + lang=en reuses the user-only Korean
+            # prompt structure (the header is already stripped).
             prompt = select_node_user_prompt(
+                query, summaries, path_so_far=effective_path or None,
+            )
+        elif use_en:
+            prompt = select_node_prompt_en(
                 query, summaries, path_so_far=effective_path or None,
             )
         else:
@@ -212,7 +232,7 @@ def run_retrieval(
             shown_ids.add(s.node_id)
 
         if use_prompt_cache and not json_mode:
-            response = system_chat_fn(SELECT_NODE_SYSTEM, prompt)
+            response = system_chat_fn(active_select_system, prompt)
         else:
             response = chat_fn(prompt)
 
@@ -228,7 +248,7 @@ def run_retrieval(
             )
             retry_prompt = build_retry_prompt(prompt, str(e))
             if use_prompt_cache and not json_mode:
-                retry_response = system_chat_fn(SELECT_NODE_SYSTEM, retry_prompt)
+                retry_response = system_chat_fn(active_select_system, retry_prompt)
             else:
                 retry_response = chat_fn(retry_prompt)
             try:
@@ -306,7 +326,10 @@ def run_retrieval(
             eval_response = chat_fn(eval_prompt)
         elif use_prompt_cache:
             eval_prompt = evaluate_user_prompt(query, picked.title, content)
-            eval_response = system_chat_fn(EVALUATE_SYSTEM, eval_prompt)
+            eval_response = system_chat_fn(active_evaluate_system, eval_prompt)
+        elif use_en:
+            eval_prompt = evaluate_prompt_en(query, picked.title, content)
+            eval_response = chat_fn(eval_prompt)
         else:
             eval_prompt = evaluate_prompt(query, picked.title, content)
             eval_response = chat_fn(eval_prompt)
@@ -374,7 +397,10 @@ def run_retrieval(
         answer = chat_fn(final_prompt).strip()
     elif use_prompt_cache:
         final_user = final_answer_user_prompt(query, gathered)
-        answer = system_chat_fn(FINAL_ANSWER_SYSTEM, final_user).strip()
+        answer = system_chat_fn(active_final_system, final_user).strip()
+    elif use_en:
+        final_prompt = final_answer_prompt_en(query, gathered)
+        answer = chat_fn(final_prompt).strip()
     else:
         final_prompt = final_answer_prompt(query, gathered)
         answer = chat_fn(final_prompt).strip()

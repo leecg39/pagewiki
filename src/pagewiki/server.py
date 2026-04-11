@@ -185,7 +185,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
     """
     try:
         from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-        from fastapi.responses import HTMLResponse, StreamingResponse
+        from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
         from pydantic import BaseModel, Field
     except ImportError as e:
         raise RuntimeError(
@@ -194,7 +194,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="1.0.0")
+    app = FastAPI(title="pagewiki API", version="1.1.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -335,12 +335,124 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
             "active_sessions": len(state.sessions),
         }
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    def metrics() -> str:
+        """Return Prometheus text-format metrics (v1.1).
+
+        Meant to be scraped by Prometheus / VictoriaMetrics / similar.
+        Exposes cumulative counters from the in-memory ``UsageTracker``
+        plus a gauge for loaded note count and active chat sessions.
+        When ``--usage-db`` is set, the store's lifetime totals are
+        also emitted as separate metrics so operators can build
+        dashboards over the full history, not just the current
+        process.
+
+        All metric names are prefixed with ``pagewiki_`` so they
+        don't collide with standard process metrics.
+        """
+        t = state.tracker
+        note_count = sum(1 for n in state.root.walk() if n.kind == "note")
+        long_count = sum(
+            1
+            for n in state.root.walk()
+            if n.kind == "note" and n.tier == NoteTier.LONG
+        )
+
+        lines: list[str] = []
+
+        def _counter(name: str, value: object, help_text: str) -> None:
+            lines.append(f"# HELP pagewiki_{name} {help_text}")
+            lines.append(f"# TYPE pagewiki_{name} counter")
+            lines.append(f"pagewiki_{name} {value}")
+
+        def _gauge(name: str, value: object, help_text: str) -> None:
+            lines.append(f"# HELP pagewiki_{name} {help_text}")
+            lines.append(f"# TYPE pagewiki_{name} gauge")
+            lines.append(f"pagewiki_{name} {value}")
+
+        # Process counters — in-memory tracker since server start.
+        _counter(
+            "llm_calls_total", t.total_calls,
+            "Total LLM calls since server start",
+        )
+        _counter(
+            "prompt_tokens_total", t.total_prompt_tokens,
+            "Total prompt tokens consumed",
+        )
+        _counter(
+            "completion_tokens_total", t.total_completion_tokens,
+            "Total completion tokens produced",
+        )
+        _counter(
+            "cacheable_calls_total", t.cacheable_calls,
+            "LLM calls dispatched through the prompt-cache path",
+        )
+
+        # Per-phase breakdown via labeled counters.
+        lines.append("# HELP pagewiki_phase_calls_total LLM calls per phase")
+        lines.append("# TYPE pagewiki_phase_calls_total counter")
+        lines.append(
+            "# HELP pagewiki_phase_prompt_tokens_total Prompt tokens per phase"
+        )
+        lines.append("# TYPE pagewiki_phase_prompt_tokens_total counter")
+        for phase, bucket in t.by_phase().items():
+            safe_phase = phase.replace('"', '\\"')
+            lines.append(
+                f'pagewiki_phase_calls_total{{phase="{safe_phase}"}} '
+                f'{int(bucket["calls"])}'
+            )
+            lines.append(
+                f'pagewiki_phase_prompt_tokens_total{{phase="{safe_phase}"}} '
+                f'{int(bucket["prompt"])}'
+            )
+
+        # Gauges.
+        _gauge(
+            "note_count", note_count,
+            "Notes loaded in memory (post-filter)",
+        )
+        _gauge(
+            "long_note_count", long_count,
+            "LONG tier notes (these get PageIndex sub-trees)",
+        )
+        _gauge(
+            "active_sessions", len(state.sessions),
+            "In-flight chat sessions",
+        )
+        _gauge(
+            "cacheable_ratio", f"{t.cacheable_ratio():.6f}",
+            "Fraction of calls using the prompt-cache path (0-1)",
+        )
+        _gauge(
+            "cache_inferred_hit_rate",
+            f"{t.cacheable_latency_savings()['inferred_hit_rate']:.6f}",
+            "Inferred KV-cache hit rate from latency comparison (0-1)",
+        )
+
+        # Persistent totals from SQLite store (lifetime).
+        if state.usage_store is not None:
+            summary = state.usage_store.query_summary()
+            _counter(
+                "persistent_llm_calls_total", summary.total_calls,
+                "Lifetime LLM calls from the SQLite store",
+            )
+            _counter(
+                "persistent_prompt_tokens_total", summary.total_prompt,
+                "Lifetime prompt tokens from the SQLite store",
+            )
+            _counter(
+                "persistent_completion_tokens_total", summary.total_completion,
+                "Lifetime completion tokens from the SQLite store",
+            )
+
+        return "\n".join(lines) + "\n"
 
     @app.post("/scan", response_model=ScanResponse)
     def scan() -> ScanResponse:
