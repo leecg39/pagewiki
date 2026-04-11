@@ -33,37 +33,36 @@ from .vault import (
 console = Console()
 
 
-def _make_chat_fn(model: str, num_ctx: int, tracker=None):
+def _make_chat_fn(model: str, num_ctx: int, tracker=None, usage_store=None):
     """Build a chat_fn closure bound to a specific Ollama model.
 
     Imported lazily so `pagewiki scan` works even when LiteLLM / Ollama are
     not installed locally.
 
     When ``tracker`` is provided, every call is recorded with real
-    prompt/completion token counts from LiteLLM (v0.8).
+    prompt/completion token counts from LiteLLM (v0.8). When
+    ``usage_store`` is additionally provided, events are also
+    persisted to a SQLite file (v0.10).
     """
     from .ollama_client import chat
 
-    if tracker is None:
+    if tracker is None and usage_store is None:
         def _call(prompt: str) -> str:
             return chat(prompt, model=model, num_ctx=num_ctx).text
         return _call
 
-    # Wrap so each call lands in the tracker. The phase label is
-    # ``other`` by default; retrieval/compile sites can re-wrap the
-    # returned fn with make_tracking_str_chat_fn for finer buckets.
     import time as _time
 
     def _call(prompt: str) -> str:
         t0 = _time.time()
         response = chat(prompt, model=model, num_ctx=num_ctx)
         elapsed = _time.time() - t0
-        tracker.record(
-            "other",
-            response.prompt_tokens or 0,
-            response.completion_tokens or 0,
-            elapsed,
-        )
+        prompt_tokens = response.prompt_tokens or 0
+        completion_tokens = response.completion_tokens or 0
+        if tracker is not None:
+            tracker.record("other", prompt_tokens, completion_tokens, elapsed)
+        if usage_store is not None:
+            usage_store.record("other", prompt_tokens, completion_tokens, elapsed)
         return response.text
 
     return _call
@@ -684,6 +683,18 @@ def watch(
     type=int,
     help="Hard cap on total tokens for this query. Loop aborts when exceeded (v0.9).",
 )
+@click.option(
+    "--json-mode",
+    "json_mode",
+    is_flag=True,
+    help="Use JSON-schema prompts + parser for SELECT/EVALUATE (v0.10).",
+)
+@click.option(
+    "--reuse-context",
+    "reuse_context",
+    is_flag=True,
+    help="Compact path_so_far + suppress already-shown candidates (v0.10).",
+)
 def ask(
     query: str,
     vault: Path | None,
@@ -700,6 +711,8 @@ def ask(
     decompose: bool,
     usage: bool,
     max_tokens: int | None,
+    json_mode: bool,
+    reuse_context: bool,
 ) -> None:
     """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
@@ -816,6 +829,8 @@ def ask(
         "cross-ref": "[magenta]XREF[/]",
         "finalize": "[green]DONE[/]",
         "decompose": "[blue]DECOMP[/]",
+        "reuse": "[dim]REUSE[/]",
+        "budget": "[red]BUDGET[/]",
     }
 
     def _on_event(step: TraceStep) -> None:
@@ -828,12 +843,14 @@ def ask(
             query, root, chat_fn,
             link_index=link_index, on_event=_on_event,
             max_tokens=max_tokens, tracker=tracker,
+            json_mode=json_mode, reuse_context=reuse_context,
         )
     else:
         result = run_retrieval(
             query, root, chat_fn,
             link_index=link_index, on_event=_on_event,
             max_tokens=max_tokens, tracker=tracker,
+            json_mode=json_mode, reuse_context=reuse_context,
         )
 
     elapsed = time.time() - start
@@ -1058,6 +1075,8 @@ def chat(
         "cross-ref": "[magenta]XREF[/]",
         "finalize": "[green]DONE[/]",
         "decompose": "[blue]DECOMP[/]",
+        "reuse": "[dim]REUSE[/]",
+        "budget": "[red]BUDGET[/]",
     }
 
     def _on_event(step: _TraceStep) -> None:
@@ -1206,6 +1225,13 @@ def chat(
 )
 @click.option("--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1")
 @click.option("--port", default=8000, type=int, help="Bind port. Default: 8000")
+@click.option(
+    "--usage-db",
+    "usage_db",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Optional SQLite path for persistent usage tracking (v0.10).",
+)
 def serve(
     vault: Path | None,
     extra_vaults: tuple[Path, ...],
@@ -1215,6 +1241,7 @@ def serve(
     max_workers: int,
     host: str,
     port: int,
+    usage_db: Path | None,
 ) -> None:
     """Run pagewiki as an HTTP API server (v0.7).
 
@@ -1254,12 +1281,21 @@ def serve(
     )
     console.print("[dim]Warming up: scanning + summarizing...[/]")
 
-    # v0.9: wire a cumulative UsageTracker into the server's chat_fn
-    # so /usage endpoint can report real token counts.
+    # v0.9: cumulative UsageTracker. v0.10: optional UsageStore.
     from .usage import UsageTracker
 
     tracker = UsageTracker()
-    chat_fn = _make_chat_fn(model, num_ctx, tracker=tracker)
+
+    usage_store = None
+    if usage_db is not None:
+        from .usage_store import UsageStore
+
+        usage_store = UsageStore(usage_db)
+        console.print(f"[dim]Usage persistence: {usage_db}[/]")
+
+    chat_fn = _make_chat_fn(
+        model, num_ctx, tracker=tracker, usage_store=usage_store,
+    )
 
     try:
         state = build_initial_state(
@@ -1274,8 +1310,9 @@ def serve(
         console.print(f"[red]Failed to build initial state: {e}[/]")
         sys.exit(1)
 
-    # Attach the same tracker to state so HTTP handlers can read it.
+    # Attach the same tracker + store to state so HTTP handlers can read them.
     state.tracker = tracker
+    state.usage_store = usage_store
 
     note_count = sum(1 for n in state.root.walk() if n.kind == "note")
     console.print(f"[dim]Ready! {note_count} notes loaded. Press Ctrl+C to stop.[/]")

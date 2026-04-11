@@ -26,12 +26,16 @@ from .prompts import (
     build_retry_prompt,
     decompose_query_prompt,
     evaluate_prompt,
+    evaluate_prompt_json,
     final_answer_prompt,
     final_answer_with_history_prompt,
     parse_decompose_response,
     parse_evaluate_response,
+    parse_evaluate_response_json,
     parse_select_response,
+    parse_select_response_json,
     select_node_prompt,
+    select_node_prompt_json,
     synthesize_multi_answer_prompt,
 )
 from .tree import TreeNode
@@ -149,6 +153,8 @@ def run_retrieval(
     history: list[tuple[str, str]] | None = None,
     max_tokens: int | None = None,
     tracker: UsageTracker | None = None,
+    json_mode: bool = False,
+    reuse_context: bool = False,
 ) -> RetrievalResult:
     """Run the multi-hop reasoning loop.
 
@@ -177,6 +183,14 @@ def run_retrieval(
             enforcement. The caller is responsible for wiring
             ``chat_fn`` through a tracking wrapper so usage is
             actually recorded.
+        json_mode: v0.10 — when True, use JSON-schema prompts and
+            parsers for SELECT and EVALUATE phases. Automatically
+            falls back to the legacy text parser if JSON parsing
+            fails twice in a row.
+        reuse_context: v0.10 — when True, enable context reuse
+            optimizations: truncate ``path_so_far`` to the last 3
+            entries and suppress candidates whose node_ids were
+            already shown in a previous iteration.
 
     Returns:
         RetrievalResult with answer, cited node ids, and reasoning trace.
@@ -191,6 +205,11 @@ def run_retrieval(
     gathered: list[tuple[str, str]] = []  # (title, content)
     cited: list[str] = []
     visited_ids: set[str] = set()
+    # v0.10: track every node_id that appeared as a candidate in any
+    # past iteration so reuse_context can suppress it on subsequent
+    # SELECT prompts. This is distinct from visited_ids (which only
+    # fills on an actual pick).
+    shown_ids: set[str] = set()
     path_so_far: list[str] = []
 
     # Build the wiki-link index for cross-reference traversal (v0.2).
@@ -278,18 +297,67 @@ def run_retrieval(
             summaries = reordered_summaries
             candidates = reordered_candidates
 
-        prompt = select_node_prompt(
-            query,
-            summaries,
-            path_so_far=path_so_far or None,
-        )
+        # v0.10 context reuse: drop already-shown candidates and
+        # truncate the breadcrumb so the prompt stays compact on
+        # deep loops. We still track IDs globally via visited_ids,
+        # but reuse_context additionally suppresses "near miss"
+        # nodes that were shown but not picked.
+        effective_path = path_so_far
+        if reuse_context and path_so_far and len(path_so_far) > 3:
+            effective_path = [
+                "...(생략)",
+                *path_so_far[-3:],
+            ]
+        if reuse_context and shown_ids:
+            pre_len = len(summaries)
+            kept = [
+                (s, c) for s, c in zip(summaries, candidates, strict=True)
+                if s.node_id not in shown_ids
+            ]
+            if kept:
+                summaries = [s for s, _ in kept]
+                candidates = [c for _, c in kept]
+                if len(summaries) < pre_len:
+                    _record(
+                        TraceStep(
+                            "reuse",
+                            None,
+                            f"suppressed {pre_len - len(summaries)} already-shown candidates",
+                        )
+                    )
+
+        # v0.10 JSON-mode: choose prompt + parser based on flag.
+        if json_mode:
+            prompt = select_node_prompt_json(
+                query,
+                summaries,
+                path_so_far=effective_path or None,
+            )
+        else:
+            prompt = select_node_prompt(
+                query,
+                summaries,
+                path_so_far=effective_path or None,
+            )
+
+        # Track all summary ids shown so future iterations can elide
+        # them when reuse_context is on.
+        for s in summaries:
+            shown_ids.add(s.node_id)
+
         response = chat_fn(prompt)
 
+        _select_parser = (
+            parse_select_response_json if json_mode else parse_select_response
+        )
+
         try:
-            action, value = parse_select_response(response)
+            action, value = _select_parser(response)
         except ValueError as e:
             # v0.8 parse-retry: give the LLM one more chance with a
-            # stricter format reminder before aborting the loop.
+            # stricter format reminder. v0.10: if JSON-mode retry
+            # also fails, fall through to the legacy text parser so
+            # a model that ignored the JSON directive still works.
             _record(
                 TraceStep(
                     "select",
@@ -299,12 +367,29 @@ def run_retrieval(
             )
             retry_response = chat_fn(build_retry_prompt(prompt, str(e)))
             try:
-                action, value = parse_select_response(retry_response)
+                action, value = _select_parser(retry_response)
                 _record(TraceStep("select", None, "retry succeeded"))
             except ValueError as e2:
-                _record(TraceStep("select", None, f"retry failed: {e2}"))
-                done_reason = f"응답 파싱 실패: {e2}"
-                break
+                if json_mode:
+                    try:
+                        action, value = parse_select_response(retry_response)
+                        _record(
+                            TraceStep(
+                                "select",
+                                None,
+                                "JSON retry failed, fell back to text parser",
+                            )
+                        )
+                    except ValueError:
+                        _record(
+                            TraceStep("select", None, f"retry failed: {e2}"),
+                        )
+                        done_reason = f"응답 파싱 실패: {e2}"
+                        break
+                else:
+                    _record(TraceStep("select", None, f"retry failed: {e2}"))
+                    done_reason = f"응답 파싱 실패: {e2}"
+                    break
 
         if action == "DONE":
             _record(TraceStep("select", None, f"DONE: {value}"))
@@ -358,10 +443,19 @@ def run_retrieval(
             _record(TraceStep("evaluate", picked.node_id, "empty content"))
             continue
 
-        eval_prompt = evaluate_prompt(query, picked.title, content)
+        # v0.10 JSON-mode for evaluate phase.
+        if json_mode:
+            eval_prompt = evaluate_prompt_json(query, picked.title, content)
+        else:
+            eval_prompt = evaluate_prompt(query, picked.title, content)
         eval_response = chat_fn(eval_prompt)
+
+        _eval_parser = (
+            parse_evaluate_response_json if json_mode else parse_evaluate_response
+        )
+
         try:
-            sufficient, reason = parse_evaluate_response(eval_response)
+            sufficient, reason = _eval_parser(eval_response)
         except ValueError as e:
             _record(TraceStep("evaluate", picked.node_id, f"parse error: {e}"))
             # Treat parse failure as "gather this and keep going"
@@ -475,6 +569,8 @@ def run_decomposed_retrieval(
     max_sub_queries: int = 4,
     max_tokens: int | None = None,
     tracker: UsageTracker | None = None,
+    json_mode: bool = False,
+    reuse_context: bool = False,
 ) -> RetrievalResult:
     """Decompose a complex query into sub-queries, retrieve in parallel, synthesize.
 
@@ -510,6 +606,8 @@ def run_decomposed_retrieval(
             on_event=on_event,
             max_tokens=max_tokens,
             tracker=tracker,
+            json_mode=json_mode,
+            reuse_context=reuse_context,
         )
 
     if on_event is not None:
@@ -545,6 +643,8 @@ def run_decomposed_retrieval(
             on_event=on_event,
             max_tokens=max_tokens,
             tracker=tracker,
+            json_mode=json_mode,
+            reuse_context=reuse_context,
         )
         sub_results.append((sub, sub_result))
         merged_trace.extend(sub_result.trace)

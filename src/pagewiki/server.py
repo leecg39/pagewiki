@@ -58,6 +58,7 @@ from .retrieval import (
 )
 from .tree import NoteTier, TreeNode
 from .usage import UsageTracker
+from .usage_store import UsageStore
 from .vault import (
     build_long_subtrees,
     filter_tree,
@@ -107,6 +108,10 @@ class ServerState:
     # call so operators can monitor token budgets across the whole
     # server lifetime via GET /usage.
     tracker: UsageTracker = field(default_factory=UsageTracker)
+    # v0.10 optional SQLite-backed usage persistence. When set, the
+    # /usage endpoint reports historical totals in addition to the
+    # in-memory tracker. Enabled via `pagewiki serve --usage-db PATH`.
+    usage_store: UsageStore | None = None
 
     def rescan(self) -> dict[str, int]:
         """Re-scan the vault(s) and rebuild caches in place.
@@ -174,6 +179,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
     """
     try:
         from fastapi import Body, FastAPI, HTTPException
+        from fastapi.responses import StreamingResponse
         from pydantic import BaseModel, Field
     except ImportError as e:
         raise RuntimeError(
@@ -182,7 +188,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
             f"Original error: {e}"
         ) from e
 
-    app = FastAPI(title="pagewiki API", version="0.9.0")
+    app = FastAPI(title="pagewiki API", version="0.10.0")
 
     # ── Request/response models ────────────────────────────────────────────
 
@@ -233,6 +239,11 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         total_tokens: int
         total_elapsed: float
         by_phase: dict[str, PhaseUsage]
+        # v0.10: optional persistent totals from SQLite store.
+        # ``None`` when the server was started without --usage-db.
+        persistent_total_calls: int | None = None
+        persistent_total_prompt: int | None = None
+        persistent_total_completion: int | None = None
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -278,7 +289,7 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         note_count = sum(1 for n in state.root.walk() if n.kind == "note")
         return {
             "status": "ok",
-            "version": "0.9.0",
+            "version": "0.10.0",
             "model": state.model,
             "vault_count": len(state.vaults),
             "note_count": note_count,
@@ -349,8 +360,23 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
 
     @app.get("/usage", response_model=UsageResponse)
     def get_usage() -> UsageResponse:
-        """Return cumulative token usage since server startup (v0.9)."""
+        """Return cumulative token usage since server startup (v0.9).
+
+        When the server was started with ``--usage-db PATH``,
+        ``persistent_total_*`` fields are also populated from the
+        SQLite store covering the entire store lifetime (v0.10).
+        """
         t = state.tracker
+
+        persistent_calls = None
+        persistent_prompt = None
+        persistent_completion = None
+        if state.usage_store is not None:
+            summary = state.usage_store.query_summary()
+            persistent_calls = summary.total_calls
+            persistent_prompt = summary.total_prompt
+            persistent_completion = summary.total_completion
+
         return UsageResponse(
             total_calls=t.total_calls,
             total_prompt_tokens=t.total_prompt_tokens,
@@ -366,6 +392,9 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
                 )
                 for phase, b in t.by_phase().items()
             },
+            persistent_total_calls=persistent_calls,
+            persistent_total_prompt=persistent_prompt,
+            persistent_total_completion=persistent_completion,
         )
 
     @app.post("/usage/reset")
@@ -373,6 +402,92 @@ def create_app(state: ServerState):  # -> fastapi.FastAPI
         """Clear the cumulative usage tracker (v0.9)."""
         state.tracker.events.clear()
         return {"status": "reset"}
+
+    # ── v0.10 SSE streaming endpoint ──────────────────────────────────────
+
+    @app.post("/ask/stream")
+    def ask_stream(req: AskRequest = Body(...)):  # noqa: B008
+        """Stream retrieval events as Server-Sent Events (v0.10).
+
+        Events:
+
+          * ``trace``  — one per ``TraceStep`` emitted by the loop
+          * ``answer`` — the final answer + cited nodes
+          * ``error``  — unexpected exceptions during retrieval
+
+        The retrieval loop is synchronous, so we run it on a
+        ThreadPoolExecutor and bridge events through a
+        ``queue.Queue``. FastAPI's ``StreamingResponse`` yields the
+        events to the client as they arrive.
+        """
+        import json as _json
+        import queue
+        import threading as _threading
+
+        event_queue: queue.Queue[tuple[str, dict] | None] = queue.Queue()
+
+        def on_event(step: TraceStep) -> None:
+            event_queue.put(
+                (
+                    "trace",
+                    {
+                        "phase": step.phase,
+                        "node_id": step.node_id,
+                        "detail": step.detail,
+                    },
+                )
+            )
+
+        def worker() -> None:
+            try:
+                root = _filtered_root(req.tags, req.after, req.before)
+                if req.decompose:
+                    result = run_decomposed_retrieval(
+                        req.query, root, state.chat_fn,
+                        link_index=state.link_index,
+                        on_event=on_event,
+                    )
+                else:
+                    result = run_retrieval(
+                        req.query, root, state.chat_fn,
+                        link_index=state.link_index,
+                        on_event=on_event,
+                    )
+                event_queue.put(
+                    (
+                        "answer",
+                        {
+                            "answer": result.answer,
+                            "cited_nodes": result.cited_nodes,
+                            "iterations_used": result.iterations_used,
+                        },
+                    )
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                event_queue.put(("error", {"message": str(exc)}))
+            finally:
+                event_queue.put(None)  # sentinel
+
+        _threading.Thread(target=worker, daemon=True).start()
+
+        def event_stream():
+            while True:
+                item = event_queue.get()
+                if item is None:
+                    break
+                event_name, data = item
+                yield f"event: {event_name}\n"
+                yield f"data: {_json.dumps(data, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     return app
 

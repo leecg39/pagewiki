@@ -152,6 +152,7 @@ pagewiki/
 │   ├── logger.py             # QueryRecord → .pagewiki-log
 │   ├── server.py             # FastAPI HTTP 서버 (v0.7, optional)
 │   ├── usage.py              # 토큰 사용량 추적 (v0.8)
+│   ├── usage_store.py        # SQLite usage 영속화 (v0.10)
 │   ├── ranking.py            # BM25-style 후보 사전 랭킹 (v0.8)
 │   └── _vendor/pageindex/    # 번들된 PageIndex SDK (MIT)
 ├── obsidian-plugin/
@@ -209,7 +210,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.6 | 대화형 모드 + 캐시 + 필터 + 스트리밍 — 아래 §7.1 상세 |
 | v0.7 | 병렬 LLM + 멀티쿼리 분해 + 멀티 vault + API 서버 — 아래 §7.2 상세 |
 | v0.8 | 토큰 사용량 추적 + 파싱 재시도 + BM25 사전 랭킹 — 아래 §7.3 상세 |
-| **v0.9** (현재) | **토큰 예산 + chat usage + /usage endpoint + cited 재정렬** — 아래 §7.4 상세 |
+| v0.9 | 토큰 예산 + chat usage + /usage endpoint + cited 재정렬 — 아래 §7.4 상세 |
+| **v0.10** (현재) | **JSON-mode + SQLite usage + SSE 스트리밍 + context reuse** — 아래 §7.5 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -259,12 +261,21 @@ DELETE /chat/{sid}      # 세션 삭제
 | Server `/usage` | server.py `GET /usage`, `POST /usage/reset` | `ServerState.tracker`가 서버 lifetime 동안 모든 LLM 호출 누적. FastAPI 엔드포인트로 cumulative counts + phase 분해 반환. reset 엔드포인트로 모니터링 윈도우 초기화 가능. |
 | Cited note 재정렬 | retrieval.py + ranking.py | `gathered` 목록을 `rank_candidates`로 쿼리 관련도 순으로 재정렬해 `cited_nodes`가 discovery order가 아닌 relevance order로 반환. Zero-LLM 비용 (기존 BM25 스코어러 재사용). |
 
-### 7.5 v0.10+ 향후 계획
+### 7.5 v0.10 상세
 
-- Pydantic JSON-mode 출력 (LLM이 JSON으로 응답 → strict 파싱)
-- 컨텍스트 reuse: 반복 iteration 시 ToC 델타만 재전송
-- Usage persistence: 서버 재시작 후에도 누적 사용량 유지 (SQLite)
-- Streaming responses: `POST /ask` SSE 스트리밍으로 실시간 trace 전달
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| JSON-mode | prompts.py `select_node_prompt_json` / `evaluate_prompt_json` + `parse_*_response_json` | LLM이 `{"action": "SELECT", "node_id": "..."}` 형식의 JSON 객체로 응답. 파서는 markdown code fence + 앞뒤 noise tolerant. `run_retrieval(json_mode=True)` 혹은 `ask --json-mode`. JSON retry가 실패하면 v0.8 text parser로 자동 fall-back. |
+| SQLite usage 영속화 | usage_store.py `UsageStore` | SQLite `usage_events` 테이블 (timestamp, phase, prompt, completion, elapsed). WAL 모드 + phase/timestamp 인덱스. `query_summary(since, until)` for 집계. `pagewiki serve --usage-db PATH`로 활성화. `/usage` 엔드포인트가 `persistent_total_*` 필드 추가. |
+| SSE 스트리밍 | server.py `POST /ask/stream` | `fastapi.StreamingResponse`로 SSE 이벤트 반환. `trace` 이벤트 (TraceStep당 하나) → `answer` 이벤트 (최종 답변 + cited). 동기 retrieval loop을 `threading.Thread` + `queue.Queue`로 async generator에 bridge. |
+| Context reuse | retrieval.py `shown_ids` + `reuse_context` | 각 iteration에서 후보 목록에 등장한 모든 node_id를 추적. `reuse_context=True`일 때 이후 iteration에서는 이미 보여준 후보를 자동 제거 → 프롬프트 길이 감소. path_so_far가 3단계 넘으면 `...(생략)` 프리픽스로 truncate. CLI `ask --reuse-context`. |
+
+### 7.6 v0.11+ 향후 계획
+
+- 쿼리당 `--max-tokens` 예산 분배 로직 (summarize vs retrieve 비율 조정)
+- `/ask/stream`에 usage 이벤트 추가 (실시간 예산 표시)
+- 대화형 chat 모드에도 SSE 스트리밍 지원
+- 멀티 vault에서 per-vault 캐시 분리 (현재는 primary vault로 통합)
 
 ## 8. 명시적 비목표 (Non-Goals)
 
