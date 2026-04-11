@@ -4,7 +4,41 @@ All notable changes to pagewiki are tracked here. The project follows
 [Semantic Versioning](https://semver.org/) and targets a stable
 **v1.0.0** release as its first production milestone.
 
-## [0.18.0] — current
+## [1.0.0] — current (stable release)
+
+### Released
+- **Development Status bumped** from `3 - Alpha` to
+  `5 - Production/Stable` in `pyproject.toml`. The API is now
+  frozen for breaking changes within the 1.x line — future
+  additions will be purely additive, and anything that would
+  break existing callers gets deferred to a hypothetical 2.0.
+- **370+ tests** across 20 test files cover every shipped feature
+  from v0.1 through v1.0: retrieval, caching, filtering,
+  streaming, parallel execution, multi-vault, API server,
+  WebSocket, usage tracking, SQLite persistence, prompt caching,
+  and the full Obsidian plugin surface.
+- **8 CLI commands** (`scan`, `ask`, `chat`, `compile`, `watch`,
+  `vaults`, `serve`, `usage-report`) with a combined 30+ flags.
+- **12 HTTP endpoints + 1 WebSocket + 1 Web UI** served by the
+  optional `[server]` extra.
+- **Obsidian plugin** with Scan/Ask/Chat/Compile/Watch/Vaults/
+  UsageHistory commands, SSE and WebSocket server modes, Cancel
+  button, and full v0.6-v0.17 flag coverage.
+
+### Summary of the 0.6 → 1.0 arc
+
+| Theme | Features |
+|---|---|
+| Interactive UX | `chat` mode, streaming retrieval trace, Web UI, Obsidian plugin |
+| Speed | Parallel LLM calls, BM25 pre-ranking, context reuse, prompt caching |
+| Quality | JSON-mode prompts, parse retry, cited-note re-ranking, multi-query decomposition |
+| Scale | Multi-vault, cross-vault parallel, per-vault cache routing, retry_failed |
+| Observability | `--usage`, `UsageTracker`, `UsageStore` SQLite, `/usage` + `/usage/history` + streaming, sparkline, cache hit rate, inferred latency savings |
+| Control | `--max-tokens`, `--token-split`, `--reuse-context`, `--prompt-cache`, `--allow-partial`, `--retry-failed`, `--json-mode`, WebSocket cancel, frontmatter filters |
+| Integration | `pagewiki serve` FastAPI HTTP+WS, SQLite usage, CSV/JSON export, `notesmd-cli` vault discovery |
+| Quality-of-life | Error messages with examples, CHANGELOG, keyboard shortcuts, daily rollups |
+
+## [0.18.0]
 
 ### Added
 - **CHANGELOG.md** — this file. Going forward every release
@@ -174,6 +208,7 @@ All notable changes to pagewiki are tracked here. The project follows
 - **v0.1.1**: Multi-hop reasoning loop implementation.
 - **v0.1**: Scaffolding, Layer 1 scanner, 3-tier classifier, CLI.
 
+[1.0.0]: https://github.com/leecg39/pagewiki
 [0.18.0]: https://github.com/leecg39/pagewiki
 [0.17.0]: https://github.com/leecg39/pagewiki
 [0.16.0]: https://github.com/leecg39/pagewiki

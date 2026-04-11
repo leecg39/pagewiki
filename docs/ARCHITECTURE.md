@@ -224,7 +224,10 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.13 | 폴리싱 + 리팩토링 — chat flags, real tokens, plugin Cancel, cross-vault×decompose, CSV/JSON, retrieval split — 아래 §7.8 상세 |
 | v0.14 | DB 정리 + `/usage/history` + Web UI + 예산 분배 + 프롬프트 캐싱 — 아래 §7.9 상세 |
 | v0.15 | Cross-vault parallel + cache hit rate + history stream + WS ext + sparkline — 아래 §7.10 상세 |
-| **v0.16** (현재) | **Parallel budget waves + inferred cache savings + history UI + WS prompt-cache + allow_partial** — 아래 §7.11 상세 |
+| v0.16 | Parallel budget waves + inferred cache savings + history UI + WS prompt-cache + allow_partial — 아래 §7.11 상세 |
+| v0.17 | /usage cache stats + background retention + retry_failed + WS cancel metadata + plugin history modal |
+| v0.18 | CHANGELOG + better error messages + Web UI keyboard shortcuts |
+| **v1.0.0** (현재) | **Stable release — 공개 API 고정, 1.x 라인 내에서는 additive-only 변경** |
 
 ### 7.1 v0.6 상세
 

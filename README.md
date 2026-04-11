@@ -1,8 +1,17 @@
-# pagewiki
+# pagewiki v1.0
 
 > Obsidian vault를 PageIndex 트리로 인덱싱하고, 로컬 Gemma 4로 reasoning-based 질의를 수행하는 vectorless RAG 도구.
 
 **핵심 철학**: `From Chunk-and-Embed... to Reason-and-Navigate.`
+
+[![Tests](https://img.shields.io/badge/tests-370%2B-brightgreen)]()
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-green)]()
+[![Stable](https://img.shields.io/badge/stability-production-success)]()
+
+> **v1.0 stable**. 공개 API가 고정되었습니다. 전체 변경 이력은
+> [`CHANGELOG.md`](CHANGELOG.md), 릴리스 노트는
+> [`docs/RELEASE_NOTES_v1.0.md`](docs/RELEASE_NOTES_v1.0.md) 참고.
 
 ## 왜 pagewiki인가
 
