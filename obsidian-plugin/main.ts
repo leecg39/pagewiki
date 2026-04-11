@@ -455,6 +455,180 @@ class AskModal extends Modal {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Usage History Modal (v0.17)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Read-only modal that subscribes to a pagewiki server's
+ * /usage/history/stream SSE endpoint and renders incoming events as
+ * a simple table. Requires Server URL to be configured; shows a
+ * helpful error otherwise.
+ */
+class UsageHistoryModal extends Modal {
+	private settings: PageWikiSettings;
+	private rowsEl!: HTMLElement;
+	private statusEl!: HTMLElement;
+	private abortController: AbortController | null = null;
+
+	constructor(app: App, settings: PageWikiSettings) {
+		super(app);
+		this.settings = settings;
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: "PageWiki Usage History" });
+
+		this.statusEl = contentEl.createDiv();
+		this.statusEl.style.fontSize = "12px";
+		this.statusEl.style.color = "var(--text-muted)";
+		this.statusEl.style.marginBottom = "8px";
+
+		if (!this.settings.serverUrl.trim()) {
+			this.statusEl.setText(
+				"Server URL is not set. Configure it in PageWiki Settings first.",
+			);
+			return;
+		}
+
+		const controls = contentEl.createDiv();
+		controls.style.display = "flex";
+		controls.style.gap = "8px";
+		controls.style.marginBottom = "12px";
+
+		const startBtn = controls.createEl("button", {
+			text: "Start",
+			cls: "mod-cta",
+		});
+		const stopBtn = controls.createEl("button", { text: "Stop" });
+		stopBtn.disabled = true;
+
+		startBtn.addEventListener("click", () => {
+			startBtn.disabled = true;
+			stopBtn.disabled = false;
+			this._start().finally(() => {
+				startBtn.disabled = false;
+				stopBtn.disabled = true;
+			});
+		});
+		stopBtn.addEventListener("click", () => {
+			if (this.abortController) this.abortController.abort();
+		});
+
+		const tableWrap = contentEl.createDiv();
+		tableWrap.style.maxHeight = "50vh";
+		tableWrap.style.overflowY = "auto";
+		tableWrap.style.border = "1px solid var(--background-modifier-border)";
+		tableWrap.style.borderRadius = "6px";
+		tableWrap.style.padding = "6px 10px";
+		tableWrap.style.fontFamily = "var(--font-monospace)";
+		tableWrap.style.fontSize = "11px";
+
+		const header = tableWrap.createDiv();
+		header.style.display = "grid";
+		header.style.gridTemplateColumns = "180px 80px 1fr 1fr";
+		header.style.gap = "8px";
+		header.style.fontWeight = "600";
+		header.style.borderBottom = "1px solid var(--background-modifier-border)";
+		header.style.paddingBottom = "4px";
+		header.createDiv().setText("timestamp");
+		header.createDiv().setText("phase");
+		header.createDiv().setText("prompt");
+		header.createDiv().setText("completion");
+
+		this.rowsEl = tableWrap.createDiv();
+	}
+
+	onClose(): void {
+		if (this.abortController) this.abortController.abort();
+		this.contentEl.empty();
+	}
+
+	private async _start(): Promise<void> {
+		const base = this.settings.serverUrl.trim().replace(/\/$/, "");
+		const url =
+			base +
+			"/usage/history/stream?poll_interval=2&initial_limit=100&max_duration=600";
+		this.statusEl.setText("connecting...");
+		this.rowsEl.empty();
+		this.abortController = new AbortController();
+
+		try {
+			const resp = await fetch(url, { signal: this.abortController.signal });
+			if (!resp.ok) {
+				this.statusEl.setText(
+					resp.status === 503
+						? "Server was started without --usage-db"
+						: "HTTP " + resp.status,
+				);
+				return;
+			}
+			this.statusEl.setText("streaming");
+			const reader = resp.body!.getReader();
+			const decoder = new TextDecoder();
+			let buf = "";
+			while (true) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				buf += decoder.decode(value, { stream: true });
+				let idx;
+				while ((idx = buf.indexOf("\n\n")) !== -1) {
+					const frame = buf.slice(0, idx);
+					buf = buf.slice(idx + 2);
+					this._handleFrame(frame);
+				}
+			}
+			this.statusEl.setText("closed");
+		} catch (err: any) {
+			if (err.name === "AbortError") this.statusEl.setText("stopped");
+			else this.statusEl.setText("error: " + err.message);
+		} finally {
+			this.abortController = null;
+		}
+	}
+
+	private _handleFrame(frame: string): void {
+		let eventName = "message";
+		let dataStr = "";
+		for (const line of frame.split("\n")) {
+			if (line.startsWith("event: ")) eventName = line.slice(7).trim();
+			else if (line.startsWith("data: ")) dataStr += line.slice(6);
+		}
+		if (!dataStr) return;
+		let data: any;
+		try { data = JSON.parse(dataStr); } catch { return; }
+
+		if (eventName === "initial") {
+			for (const e of data.events || []) this._appendRow(e);
+		} else if (eventName === "event") {
+			this._appendRow(data);
+		} else if (eventName === "heartbeat") {
+			this.statusEl.setText("streaming (idle)");
+		} else if (eventName === "done") {
+			this.statusEl.setText("closed");
+		}
+	}
+
+	private _appendRow(e: any): void {
+		const row = this.rowsEl.createDiv();
+		row.style.display = "grid";
+		row.style.gridTemplateColumns = "180px 80px 1fr 1fr";
+		row.style.gap = "8px";
+		row.style.padding = "2px 0";
+		row.style.borderBottom = "1px solid var(--background-modifier-border)";
+		const ts = new Date((e.timestamp || 0) * 1000)
+			.toISOString()
+			.replace("T", " ")
+			.slice(0, 19);
+		row.createDiv().setText(ts);
+		row.createDiv().setText(e.phase || "—");
+		row.createDiv().setText(String(e.prompt || 0));
+		row.createDiv().setText(String(e.completion || 0));
+		this.rowsEl.parentElement!.scrollTop = this.rowsEl.parentElement!.scrollHeight;
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Chat Modal (v0.6)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1096,6 +1270,13 @@ export default class PageWikiPlugin extends Plugin {
 			callback: () => this.openChatModal(),
 		});
 
+		// Command: Show usage history (v0.17)
+		this.addCommand({
+			id: "pagewiki-usage-history",
+			name: "Show usage history (server mode)",
+			callback: () => this.openUsageHistoryModal(),
+		});
+
 		// Command: Compile LLM-Wiki
 		this.addCommand({
 			id: "pagewiki-compile",
@@ -1162,6 +1343,10 @@ export default class PageWikiPlugin extends Plugin {
 
 	private openChatModal(): void {
 		new ChatModal(this.app, this.settings).open();
+	}
+
+	private openUsageHistoryModal(): void {
+		new UsageHistoryModal(this.app, this.settings).open();
 	}
 
 	private async runAsk(query: string, decompose?: boolean): Promise<void> {
