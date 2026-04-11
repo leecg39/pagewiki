@@ -37,7 +37,7 @@ class NodeSummary:
 # Phase 1: ToC Review + Phase 2: Select Node
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SELECT_NODE_SYSTEM = (
+SELECT_NODE_SYSTEM = (
     "당신은 지식 베이스 탐색 전문가입니다. "
     "사용자의 질문에 답하기 위해 가장 관련 있는 노드를 정확히 하나 선택합니다. "
     "벡터 유사도가 아닌 논리적 추론에 기반해 판단하세요."
@@ -61,7 +61,7 @@ def select_node_prompt(
     doesn't loop back.
     """
     lines: list[str] = []
-    lines.append(_SELECT_NODE_SYSTEM)
+    lines.append(SELECT_NODE_SYSTEM)
     lines.append("")
     lines.append(f"[사용자 질문]\n{query}")
     lines.append("")
@@ -92,6 +92,80 @@ def select_node_prompt(
         "  SELECT: <node_id>\n"
         "  DONE: <이유>  (관련 노드가 전혀 없을 때)\n"
         "다른 설명은 추가하지 마세요."
+    )
+    return "\n".join(lines)
+
+
+def select_node_user_prompt(
+    query: str,
+    candidates: list[NodeSummary],
+    *,
+    path_so_far: list[str] | None = None,
+) -> str:
+    """Same as ``select_node_prompt`` but WITHOUT the system preamble (v0.14).
+
+    Used by prompt-caching callers that pass ``SELECT_NODE_SYSTEM``
+    as the ``system`` role to the LLM separately. Keeping the
+    system portion stable across calls lets Ollama's KV cache reuse
+    the prefix, which significantly speeds up repeat retrievals on
+    large vaults.
+    """
+    lines: list[str] = []
+    lines.append(f"[사용자 질문]\n{query}")
+    lines.append("")
+    if path_so_far:
+        lines.append(f"[지금까지 탐색한 경로]\n{' > '.join(path_so_far)}")
+        lines.append("")
+    lines.append("[선택 가능한 노드]")
+    for idx, cand in enumerate(candidates, start=1):
+        meta = f"[{cand.kind}]"
+        if cand.token_count is not None:
+            meta += f" ~{cand.token_count}토큰"
+        if cand.tags:
+            meta += f" #{', #'.join(cand.tags)}"
+        if cand.date:
+            meta += f" ({cand.date})"
+        if cand.linked_from:
+            meta += f" [교차참조: {cand.linked_from}]"
+        summary_part = f" — {cand.summary}" if cand.summary else ""
+        lines.append(f"{idx}. {meta} {cand.title}{summary_part}")
+        lines.append(f"   node_id: {cand.node_id}")
+    lines.append("")
+    lines.append(
+        "위 후보 중 질문에 가장 관련 있는 노드 하나를 선택하세요.\n"
+        "응답 형식은 반드시 아래 중 하나여야 합니다:\n"
+        "  SELECT: <node_id>\n"
+        "  DONE: <이유>  (관련 노드가 전혀 없을 때)\n"
+        "다른 설명은 추가하지 마세요."
+    )
+    return "\n".join(lines)
+
+
+def evaluate_user_prompt(query: str, note_title: str, note_content: str) -> str:
+    """User-only variant of ``evaluate_prompt`` for prompt caching (v0.14)."""
+    return (
+        f"[사용자 질문]\n{query}\n\n"
+        f"[로드된 노트: {note_title}]\n{note_content[:12000]}\n\n"
+        "이 내용만으로 질문에 충분히 답할 수 있습니까?\n"
+        "응답 형식:\n"
+        "  SUFFICIENT: <한 줄 이유>\n"
+        "  INSUFFICIENT: <부족한 정보>\n"
+        "다른 설명은 추가하지 마세요."
+    )
+
+
+def final_answer_user_prompt(
+    query: str,
+    gathered_notes: list[tuple[str, str]],
+) -> str:
+    """User-only variant of ``final_answer_prompt`` for prompt caching (v0.14)."""
+    lines = [f"[사용자 질문]\n{query}", "", "[근거 노트]"]
+    for idx, (title, content) in enumerate(gathered_notes, start=1):
+        lines.append(f"\n--- 노트 {idx}: {title} ---\n{content[:8000]}")
+    lines.append("")
+    lines.append(
+        "위 근거를 바탕으로 질문에 한국어로 답변하세요. "
+        "답변 끝에 참조한 노트 제목을 [[제목]] 형식으로 나열하세요."
     )
     return "\n".join(lines)
 
@@ -153,7 +227,7 @@ def select_node_prompt_json(
     treated as noise and stripped before parsing.
     """
     lines = [
-        _SELECT_NODE_SYSTEM,
+        SELECT_NODE_SYSTEM,
         "",
         "[JSON 모드]",
         "응답은 반드시 아래 두 형식 중 하나의 JSON 객체여야 합니다:",
@@ -247,7 +321,7 @@ def evaluate_prompt_json(query: str, note_title: str, note_content: str) -> str:
         {"sufficient": false, "reason": "부족한 정보"}
     """
     return (
-        f"{_EVALUATE_SYSTEM}\n\n"
+        f"{EVALUATE_SYSTEM}\n\n"
         f"[JSON 모드]\n"
         f"응답은 반드시 아래 형식의 JSON 객체여야 합니다:\n"
         f'  {{"sufficient": true, "reason": "<한 줄 이유>"}}\n'
@@ -295,7 +369,7 @@ def parse_evaluate_response_json(response: str) -> tuple[bool, str]:
 # Phase 3: Extract & Evaluate
 # ─────────────────────────────────────────────────────────────────────────────
 
-_EVALUATE_SYSTEM = (
+EVALUATE_SYSTEM = (
     "당신은 지식 평가 전문가입니다. "
     "주어진 노트 내용만으로 사용자 질문에 충분히 답할 수 있는지 판단하세요."
 )
@@ -310,7 +384,7 @@ def evaluate_prompt(query: str, note_title: str, note_content: str) -> str:
         INSUFFICIENT: <what's missing>
     """
     return (
-        f"{_EVALUATE_SYSTEM}\n\n"
+        f"{EVALUATE_SYSTEM}\n\n"
         f"[사용자 질문]\n{query}\n\n"
         f"[로드된 노트: {note_title}]\n{note_content[:12000]}\n\n"
         "이 내용만으로 질문에 충분히 답할 수 있습니까?\n"
@@ -336,7 +410,7 @@ def parse_evaluate_response(response: str) -> tuple[bool, str]:
 # Phase 4: Final Answer
 # ─────────────────────────────────────────────────────────────────────────────
 
-_FINAL_ANSWER_SYSTEM = (
+FINAL_ANSWER_SYSTEM = (
     "당신은 연구 어시스턴트입니다. "
     "주어진 근거 노트들만 사용해 사용자 질문에 답변하세요. "
     "근거에 없는 내용은 추측하지 말고 '근거 부족'이라고 명시하세요."
@@ -353,7 +427,7 @@ def final_answer_prompt(
         query: Original user question.
         gathered_notes: List of (title, content) tuples collected during the loop.
     """
-    lines = [_FINAL_ANSWER_SYSTEM, "", f"[사용자 질문]\n{query}", ""]
+    lines = [FINAL_ANSWER_SYSTEM, "", f"[사용자 질문]\n{query}", ""]
     lines.append("[근거 노트]")
     for idx, (title, content) in enumerate(gathered_notes, start=1):
         lines.append(f"\n--- 노트 {idx}: {title} ---\n{content[:8000]}")
@@ -516,7 +590,7 @@ def final_answer_with_history_prompt(
     Same as ``final_answer_prompt`` but prepends recent history so the
     LLM can reference prior answers and avoid repetition.
     """
-    lines = [_FINAL_ANSWER_SYSTEM, ""]
+    lines = [FINAL_ANSWER_SYSTEM, ""]
 
     if history:
         lines.append("[이전 대화]")

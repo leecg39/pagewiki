@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 
 ChatFn = Callable[[str], str]
 
+# v0.14 prompt-caching contract: ``(system, user) -> str``. Passed
+# alongside the regular ChatFn when the caller wants Ollama KV-cache
+# reuse for stable system prefixes.
+SystemChatFn = Callable[[str, str], str]
+
 # Safety caps — prevent runaway LLM costs on pathological trees
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_MAX_GATHERED_NOTES = 4

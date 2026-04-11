@@ -136,33 +136,39 @@ def summarize_atomic_notes(
     summary_cache: SummaryCache | None = None,
     model_id: str | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    max_tokens: int | None = None,
+    tracker: object | None = None,
 ) -> int:
     """Fill in one-line summaries for every tier=ATOMIC note under `root`.
 
-    Walks the Layer 1 tree and calls `chat_fn` once per ATOMIC note. MICRO
-    notes are skipped (title-only is fine) and LONG notes are handled by
-    the PageIndex adapter, so they're skipped here too.
-
-    LLM calls are dispatched in parallel via a ``ThreadPoolExecutor``
-    (v0.7). Ollama serves concurrent requests, so this gives a
-    near-linear speedup up to the worker count.
+    LLM calls are dispatched in parallel via ``ThreadPoolExecutor``
+    (v0.7) and the on-disk ``SummaryCache`` shortcuts repeat runs
+    (v0.6). v0.14 adds a soft ``max_tokens`` budget: when the paired
+    ``tracker`` exceeds this cap, pending summary jobs are skipped
+    (the affected notes just keep their empty ``summary`` field —
+    ToC review will still work using titles only).
 
     Args:
         root: Layer 1 tree root.
         chat_fn: LLM callable (production: ollama_client.chat wrapper).
         skip_existing: If True, don't re-summarize notes that already have a
-            non-empty `summary` field. Enables cheap incremental re-runs.
-        summary_cache: Optional on-disk cache. When provided, summaries are
-            loaded from cache if the source note is unchanged, avoiding
-            redundant LLM calls on repeated ``ask`` invocations.
+            non-empty `summary` field.
+        summary_cache: Optional on-disk cache.
         model_id: LLM model identifier, required when ``summary_cache``
             is provided (part of the cache key).
         max_workers: Number of concurrent LLM calls. Default 4.
-            Set to 1 to force strictly sequential execution.
+        max_tokens: v0.14 soft cap — when ``tracker.total_tokens`` exceeds
+            this number, remaining notes are skipped. Used by
+            ``--token-split`` to carve out a summarize-phase budget.
+        tracker: ``UsageTracker`` instance used with ``max_tokens``.
 
     Returns:
         Number of notes actually summarized (i.e. LLM calls made).
     """
+    def _over_budget() -> bool:
+        if max_tokens is None or tracker is None:
+            return False
+        return getattr(tracker, "total_tokens", 0) >= max_tokens
     # Phase 1: collect work items (and apply cache hits synchronously).
     pending: list[TreeNode] = []
     for node in root.walk():
@@ -192,8 +198,15 @@ def summarize_atomic_notes(
         summary = chat_fn(prompt).strip().strip("\"'").strip()
         return node, summary
 
-    # Phase 2: parallel LLM dispatch.
-    if max_workers <= 1 or len(pending) == 1:
+    # Phase 2: parallel LLM dispatch. v0.14 budget-aware path runs
+    # sequentially so we can stop as soon as ``max_tokens`` is hit.
+    if max_tokens is not None and tracker is not None:
+        results: list[tuple[TreeNode, str]] = []
+        for node in pending:
+            if _over_budget():
+                break
+            results.append(_summarize_one(node))
+    elif max_workers <= 1 or len(pending) == 1:
         results = [_summarize_one(n) for n in pending]
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:

@@ -46,12 +46,14 @@ from .types import (
     ChatFn,
     EventCallback,
     RetrievalResult,
+    SystemChatFn,
     TraceStep,
 )
 
 __all__ = [
     # Types
     "ChatFn",
+    "SystemChatFn",
     "EventCallback",
     "RetrievalResult",
     "TraceStep",

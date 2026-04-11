@@ -39,6 +39,7 @@ Design notes
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -254,6 +255,69 @@ class UsageStore:
             cursor = self._conn.execute("DELETE FROM usage_events")
             self._conn.execute("DELETE FROM usage_daily")
             return cursor.rowcount
+
+    def prune_events_before(
+        self,
+        cutoff_timestamp: float,
+        *,
+        rollup_first: bool = True,
+    ) -> int:
+        """Delete raw events older than ``cutoff_timestamp`` (v0.14).
+
+        Rolling retention: for long-running servers that would
+        otherwise grow the ``usage_events`` table indefinitely, this
+        trims the raw event log while preserving the daily rollup
+        table. When ``rollup_first=True`` (default), any days that
+        would be affected by the prune are rolled up first so the
+        aggregated history is preserved.
+
+        Args:
+            cutoff_timestamp: unix epoch seconds. Events with
+                ``timestamp < cutoff_timestamp`` are deleted.
+            rollup_first: if True, call ``rollup_range`` to flush
+                every day in the prune window into ``usage_daily``
+                before deletion. Leave True unless you're certain
+                the rollups are already current.
+
+        Returns:
+            Number of event rows deleted.
+        """
+        if rollup_first:
+            # Find the earliest event to figure out the rollup start.
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT MIN(timestamp) FROM usage_events "
+                    "WHERE timestamp < ?",
+                    (cutoff_timestamp,),
+                ).fetchone()
+            if row is not None and row[0] is not None:
+                since_date = datetime.fromtimestamp(row[0]).date().isoformat()
+                # Roll up through the day BEFORE the cutoff so partial
+                # current-day events aren't prematurely aggregated.
+                until_date = (
+                    datetime.fromtimestamp(cutoff_timestamp).date()
+                    - timedelta(days=1)
+                ).isoformat()
+                if until_date >= since_date:
+                    self.rollup_range(since=since_date, until=until_date)
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM usage_events WHERE timestamp < ?",
+                (cutoff_timestamp,),
+            )
+            # Reclaim space immediately — VACUUM is cheap on small
+            # WAL-mode SQLite and avoids surprise bloat. VACUUM can
+            # fail inside a transaction context on some SQLite
+            # builds; silently ignore rather than propagate.
+            with contextlib.suppress(sqlite3.OperationalError):
+                self._conn.execute("VACUUM")
+            return cursor.rowcount
+
+    def prune_older_than_days(self, days: int) -> int:
+        """Convenience wrapper: delete events older than ``days`` ago."""
+        cutoff = time.time() - (days * 86400.0)
+        return self.prune_events_before(cutoff)
 
     # ── v0.12 daily rollups ────────────────────────────────────────────────
 
