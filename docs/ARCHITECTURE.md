@@ -150,6 +150,7 @@ pagewiki/
 │   ├── obsidian_config.py    # 볼트 자동 발견 (notesmd-cli / obsidian.json)
 │   ├── ollama_client.py      # LiteLLM + Ollama 래퍼
 │   ├── logger.py             # QueryRecord → .pagewiki-log
+│   ├── server.py             # FastAPI HTTP 서버 (v0.7, optional)
 │   └── _vendor/pageindex/    # 번들된 PageIndex SDK (MIT)
 ├── obsidian-plugin/
 │   ├── main.ts               # Obsidian 플러그인 (Scan/Ask/Chat/Compile/Watch)
@@ -203,8 +204,8 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | v0.3 | Karpathy LLM-Wiki compiler — `pagewiki compile` 서브커맨드, 2-pass 파이프라인 (entity 추출 → 위키 페이지 생성), `{vault}/LLM-Wiki/` 출력 |
 | v0.4 | 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 vault 파일 변경 실시간 감지 |
 | v0.5 | Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile/Watch 실행, Settings 탭, 결과 모달 |
-| **v0.6** (현재) | **대화형 모드 + 캐시 + 필터 + 스트리밍** — 아래 §7.1 상세 |
-| v0.7 (계획) | 병렬 LLM + 멀티쿼리 분해 + API 서버 — 아래 §7.2 상세 |
+| v0.6 | 대화형 모드 + 캐시 + 필터 + 스트리밍 — 아래 §7.1 상세 |
+| **v0.7** (현재) | **병렬 LLM + 멀티쿼리 분해 + 멀티 vault + API 서버** — 아래 §7.2 상세 |
 
 ### 7.1 v0.6 상세
 
@@ -215,26 +216,33 @@ v0.1.2부터 PageIndex는 pip 의존성이 아니라 `src/pagewiki/_vendor/pagei
 | Frontmatter 필터 | frontmatter.py, vault.py `filter_tree()` | YAML frontmatter(tags, date, aliases) 파싱 → TreeNode 필드. `--tag`/`--after`/`--before` CLI 옵션으로 트리 사전 가지치기 |
 | 실시간 스트리밍 | retrieval.py `on_event`, cli.py | `run_retrieval()`에 `EventCallback` 추가. SELECT/EVAL/XREF/DONE 단계를 실시간 표시 |
 
-### 7.2 v0.7 계획
+### 7.2 v0.7 상세
 
-**병렬 LLM 호출** (high impact):
-- 현재 `summarize_atomic_notes()`와 `compile` 파이프라인은 노트당 1회 순차 LLM 호출
-- `concurrent.futures.ThreadPoolExecutor`로 병렬화 (Ollama는 동시 요청 지원)
-- 예상 효과: 50 ATOMIC 노트 요약 시간 50x → 5x 수준으로 단축
+| 기능 | 모듈 | 설명 |
+|---|---|---|
+| 병렬 LLM 호출 | vault.py, compile.py | `summarize_atomic_notes()`와 `extract_entities_from_tree()`/`generate_wiki_pages()`를 `ThreadPoolExecutor`로 병렬화. `--max-workers`로 동시 worker 수 조정 (기본 4). Ollama는 동시 요청 지원. |
+| 멀티쿼리 분해 | retrieval.py `run_decomposed_retrieval`, prompts.py | `--decompose` 플래그 활성 시 LLM으로 복합 질문을 서브쿼리로 분해 → 각각 retrieve → synthesize. `SINGLE` 응답 시 단일 쿼리 경로로 fall-through. |
+| 멀티 vault 검색 | vault.py `scan_multi_vault()`, cli.py `--extra-vault` | 여러 볼트를 가상 루트 아래 병합. 각 노드의 `node_id`는 `<vault_name>::`로 네임스페이스 prefix. 캐시는 abs_path 기반이라 볼트 간 충돌 없음. |
+| HTTP API 서버 | server.py, cli.py `serve` | FastAPI 기반 `pagewiki serve`. 트리/캐시 startup warmup → `/health`, `/scan`, `/ask`, `/chat`(세션 관리) 엔드포인트. FastAPI는 `pip install 'pagewiki[server]'`로 선택적 설치. |
 
-**멀티쿼리 분해** (medium impact):
-- 복합 질문을 LLM으로 서브쿼리로 분해 → 각각 `run_retrieval()` → 결과 합성
-- "X와 Y의 차이점은?" → Sub-Q1: "X란?", Sub-Q2: "Y란?", Sub-Q3: "차이점 비교"
+**API 서버 엔드포인트**:
 
-**API 서버 모드** (medium impact, high effort):
-- FastAPI 기반 `pagewiki serve` 명령
-- `POST /ask`, `POST /chat` 엔드포인트 + 세션 관리
-- 트리/캐시를 서버 기동 시 1회 로드 → 반복 쿼리 시 스캔 오버헤드 제거
+```
+GET    /health          # liveness + note count
+POST   /scan            # refresh in-memory tree
+POST   /ask             # single-shot query (decompose/filter 지원)
+POST   /chat            # session-based multi-turn (session_id 자동 발급)
+DELETE /chat/{sid}      # 세션 삭제
+```
 
-**멀티 vault 지원** (medium impact, high effort):
-- `--vault` 복수 지정 또는 `--vault-all` 옵션
-- 각 vault의 TreeNode를 가상 루트 아래 병합
-- `node_id`에 vault 네임스페이스 추가 (충돌 방지)
+세션은 in-process dict로 관리, 1시간 비활성 시 자동 만료.
+
+### 7.3 v0.8+ 향후 계획
+
+- 구조화 출력 검증 (Pydantic 기반 LLM 응답 파싱)
+- BM25-style 사전 relevance 스코어링
+- 실제 토큰 카운팅 + 예산 관리 (현재는 char/3 휴리스틱)
+- 컨텍스트 reuse: ToC review 증분 업데이트
 
 ## 8. 명시적 비목표 (Non-Goals)
 

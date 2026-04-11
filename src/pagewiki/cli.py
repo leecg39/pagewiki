@@ -22,7 +22,13 @@ from .cache import SummaryCache, TreeCache
 from .logger import QueryRecord, write_log
 from .retrieval import run_retrieval
 from .tree import NoteTier
-from .vault import build_long_subtrees, filter_tree, scan_folder, summarize_atomic_notes
+from .vault import (
+    build_long_subtrees,
+    filter_tree,
+    scan_folder,
+    scan_multi_vault,
+    summarize_atomic_notes,
+)
 
 console = Console()
 
@@ -193,6 +199,33 @@ def _open_cited_notes(
             subprocess.run(argv, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as e:
             console.print(f"  [red]Failed: {e}[/]")
+
+
+def _resolve_multi_vault(
+    vaults: tuple[Path, ...],
+    fallback: Path | None,
+) -> list[Path]:
+    """Return a list of resolved vault paths.
+
+    If ``vaults`` is empty, falls back to auto-discovery (same as
+    ``_resolve_vault``). Otherwise returns the explicit list, keeping
+    order and deduplicating by resolved absolute path.
+    """
+    if not vaults:
+        return [_resolve_vault(fallback)]
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for v in vaults:
+        try:
+            abs_path = v.expanduser().resolve()
+        except OSError:
+            abs_path = v
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        resolved.append(v)
+    return resolved
 
 
 def _resolve_vault(vault: Path | None) -> Path:
@@ -403,11 +436,16 @@ def vaults() -> None:
 @click.option(
     "--num-ctx", default=131072, type=int, help="Ollama context window."
 )
+@click.option(
+    "--max-workers", default=4, type=int,
+    help="Parallel LLM workers for entity extraction + page generation.",
+)
 def compile(
     vault: Path | None,
     folder: str | None,
     model: str,
     num_ctx: int,
+    max_workers: int,
 ) -> None:
     """Compile vault notes into an LLM-Wiki (entity pages + index).
 
@@ -429,10 +467,14 @@ def compile(
         console.print("[red]No notes found to compile.[/]")
         sys.exit(1)
 
-    console.print(f"[dim]Found {note_count} notes to process...[/]")
+    console.print(
+        f"[dim]Found {note_count} notes to process (parallel: {max_workers})...[/]"
+    )
 
     chat_fn = _make_chat_fn(model, num_ctx)
-    wiki_dir = compile_wiki(root, vault, chat_fn, subfolder=folder)
+    wiki_dir = compile_wiki(
+        root, vault, chat_fn, subfolder=folder, max_workers=max_workers,
+    )
 
     # Count generated files
     generated = list(wiki_dir.glob("*.md"))
@@ -553,6 +595,13 @@ def watch(
     "notesmd-cli or obsidian.json.",
 )
 @click.option(
+    "--extra-vault",
+    "extra_vaults",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Additional vault paths for multi-vault search (v0.7, repeatable).",
+)
+@click.option(
     "--folder", default="Research", help="Subfolder inside the vault. Default: Research"
 )
 @click.option(
@@ -590,9 +639,21 @@ def watch(
     default=None,
     help="Only consider notes with date <= this value. E.g. --before 2025-06",
 )
+@click.option(
+    "--max-workers",
+    default=4,
+    type=int,
+    help="Parallel LLM workers for summarization. Default: 4. Set to 1 for sequential.",
+)
+@click.option(
+    "--decompose",
+    is_flag=True,
+    help="Decompose complex queries into sub-questions and synthesize answers (v0.7).",
+)
 def ask(
     query: str,
     vault: Path | None,
+    extra_vaults: tuple[Path, ...],
     folder: str,
     model: str,
     num_ctx: int,
@@ -601,18 +662,43 @@ def ask(
     filter_tags: tuple[str, ...],
     filter_after: str | None,
     filter_before: str | None,
+    max_workers: int,
+    decompose: bool,
 ) -> None:
-    """Run a multi-hop reasoning query against a vault folder."""
-    vault = _resolve_vault(vault)
+    """Run a multi-hop reasoning query against one or more vault folders."""
     console.print(f"[bold cyan]Q:[/] {query}")
-    console.print(f"  vault={vault}  folder={folder}  model={model}\n")
+
+    # Resolve the primary vault and collect any --extra-vault paths.
+    primary = _resolve_vault(vault)
+    all_vaults: list[Path] = [primary]
+    for extra in extra_vaults:
+        try:
+            abs_extra = extra.expanduser().resolve()
+        except OSError:
+            abs_extra = extra
+        if abs_extra not in [v.resolve() for v in all_vaults]:
+            all_vaults.append(extra)
+
+    multi_vault = len(all_vaults) > 1
+    if multi_vault:
+        vault_list = ", ".join(str(v) for v in all_vaults)
+        console.print(f"  vaults=[{vault_list}]  folder={folder}  model={model}\n")
+    else:
+        console.print(f"  vault={primary}  folder={folder}  model={model}\n")
+
+    # Keep a single canonical vault for cache / log paths.
+    vault = primary
 
     start = time.time()
     chat_fn = _make_chat_fn(model, num_ctx)
 
-    # Step 1: scan
-    console.print("[dim]1/4 Scanning vault...[/]")
-    root = scan_folder(vault, folder)
+    # Step 1: scan (multi-vault aware)
+    if multi_vault:
+        console.print(f"[dim]1/4 Scanning {len(all_vaults)} vaults...[/]")
+        root = scan_multi_vault([(v, folder) for v in all_vaults])
+    else:
+        console.print("[dim]1/4 Scanning vault...[/]")
+        root = scan_folder(vault, folder)
 
     # Apply frontmatter filters (v0.6).
     active_filters = list(filter_tags) or None
@@ -638,12 +724,15 @@ def ask(
         console.print(f"[red]No notes found in {vault / folder}[/]")
         sys.exit(1)
 
-    # Step 2: summarize atomic notes (optional, with on-disk cache)
+    # Step 2: summarize atomic notes (optional, cached, parallel in v0.7)
     if not skip_summaries:
-        console.print("[dim]2/4 Summarizing atomic notes...[/]")
+        console.print(
+            f"[dim]2/4 Summarizing atomic notes (parallel: {max_workers} workers)...[/]"
+        )
         scache = SummaryCache(vault)
         summarized = summarize_atomic_notes(
             root, chat_fn, summary_cache=scache, model_id=model,
+            max_workers=max_workers,
         )
         console.print(f"[dim]    → {summarized} notes summarized (rest from cache)[/]")
     else:
@@ -671,16 +760,20 @@ def ask(
 
     link_index = build_link_index(root)
 
-    # Step 4: retrieval loop with live streaming (v0.6)
-    console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
+    # Step 4: retrieval loop with live streaming (v0.6 streaming + v0.7 decomposition)
+    if decompose:
+        console.print("[dim]4/4 Running decomposed multi-hop retrieval...[/]\n")
+    else:
+        console.print("[dim]4/4 Running multi-hop retrieval loop...[/]\n")
 
-    from .retrieval import TraceStep
+    from .retrieval import TraceStep, run_decomposed_retrieval
 
     _phase_icons = {
         "select": "[cyan]SELECT[/]",
         "evaluate": "[yellow]EVAL[/]",
         "cross-ref": "[magenta]XREF[/]",
         "finalize": "[green]DONE[/]",
+        "decompose": "[blue]DECOMP[/]",
     }
 
     def _on_event(step: TraceStep) -> None:
@@ -688,9 +781,14 @@ def ask(
         node_part = f" [{escape(step.node_id)}]" if step.node_id else ""
         console.print(f"  {icon}{node_part} {escape(step.detail)}")
 
-    result = run_retrieval(
-        query, root, chat_fn, link_index=link_index, on_event=_on_event,
-    )
+    if decompose:
+        result = run_decomposed_retrieval(
+            query, root, chat_fn, link_index=link_index, on_event=_on_event,
+        )
+    else:
+        result = run_retrieval(
+            query, root, chat_fn, link_index=link_index, on_event=_on_event,
+        )
 
     elapsed = time.time() - start
 
@@ -729,6 +827,13 @@ def ask(
     help="Obsidian vault root.",
 )
 @click.option(
+    "--extra-vault",
+    "extra_vaults",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Additional vault paths for multi-vault search (v0.7, repeatable).",
+)
+@click.option(
     "--folder", default="Research", help="Subfolder inside the vault. Default: Research",
 )
 @click.option("--model", default="ollama/gemma4:26b", help="LiteLLM model id.")
@@ -744,8 +849,17 @@ def ask(
 )
 @click.option("--after", "filter_after", default=None, help="Notes with date >= value.")
 @click.option("--before", "filter_before", default=None, help="Notes with date <= value.")
+@click.option(
+    "--max-workers", default=4, type=int,
+    help="Parallel LLM workers. Default: 4.",
+)
+@click.option(
+    "--decompose", is_flag=True,
+    help="Decompose complex queries into sub-questions (v0.7).",
+)
 def chat(
     vault: Path | None,
+    extra_vaults: tuple[Path, ...],
     folder: str,
     model: str,
     num_ctx: int,
@@ -753,6 +867,8 @@ def chat(
     filter_tags: tuple[str, ...],
     filter_after: str | None,
     filter_before: str | None,
+    max_workers: int,
+    decompose: bool,
 ) -> None:
     """Interactive multi-turn conversation against a vault folder.
 
@@ -762,15 +878,35 @@ def chat(
     """
     from .prompts import rewrite_query_with_context
     from .retrieval import TraceStep as _TraceStep
+    from .retrieval import run_decomposed_retrieval
     from .wiki_links import build_link_index
 
-    vault = _resolve_vault(vault)
+    # Resolve primary + extra vaults for multi-vault support (v0.7).
+    primary = _resolve_vault(vault)
+    all_vaults: list[Path] = [primary]
+    for extra in extra_vaults:
+        try:
+            abs_extra = extra.expanduser().resolve()
+        except OSError:
+            abs_extra = extra
+        if abs_extra not in [v.resolve() for v in all_vaults]:
+            all_vaults.append(extra)
+
+    multi_vault = len(all_vaults) > 1
+    vault = primary
+    vault_str = (
+        f"{len(all_vaults)} vaults: " + ", ".join(v.name for v in all_vaults)
+        if multi_vault
+        else str(vault)
+    )
+
     console.print(
         Panel(
             f"[bold cyan]pagewiki chat[/] — interactive mode\n"
-            f"vault={vault}  folder={folder}  model={model}\n"
+            f"{'vaults' if multi_vault else 'vault'}={vault_str}  "
+            f"folder={folder}  model={model}\n"
             f"Type [bold]quit[/] to exit, [bold]/clear[/] to reset history.",
-            title="pagewiki v0.6",
+            title="pagewiki v0.7",
         )
     )
 
@@ -778,7 +914,10 @@ def chat(
 
     # Pre-scan once so repeated queries reuse the same tree.
     console.print("[dim]Scanning vault...[/]")
-    root = scan_folder(vault, folder)
+    if multi_vault:
+        root = scan_multi_vault([(v, folder) for v in all_vaults])
+    else:
+        root = scan_folder(vault, folder)
 
     # Apply filters.
     active_filters = list(filter_tags) or None
@@ -792,12 +931,15 @@ def chat(
         console.print(f"[red]No notes found in {vault / folder}[/]")
         sys.exit(1)
 
-    # Summarize atomic notes (cached).
+    # Summarize atomic notes (cached, parallel in v0.7).
     if not skip_summaries:
-        console.print("[dim]Summarizing atomic notes...[/]")
+        console.print(
+            f"[dim]Summarizing atomic notes (parallel: {max_workers})...[/]"
+        )
         scache = SummaryCache(vault)
         summarized = summarize_atomic_notes(
             root, chat_fn, summary_cache=scache, model_id=model,
+            max_workers=max_workers,
         )
         console.print(f"[dim]  → {summarized} summarized (rest from cache)[/]")
 
@@ -825,6 +967,7 @@ def chat(
         "evaluate": "[yellow]EVAL[/]",
         "cross-ref": "[magenta]XREF[/]",
         "finalize": "[green]DONE[/]",
+        "decompose": "[blue]DECOMP[/]",
     }
 
     def _on_event(step: _TraceStep) -> None:
@@ -862,10 +1005,16 @@ def chat(
                 console.print(f"[dim]  → rewritten: {rewritten}[/]")
                 effective_query = rewritten
 
-        result = run_retrieval(
-            effective_query, root, chat_fn,
-            link_index=link_index, on_event=_on_event, history=history,
-        )
+        if decompose:
+            result = run_decomposed_retrieval(
+                effective_query, root, chat_fn,
+                link_index=link_index, on_event=_on_event,
+            )
+        else:
+            result = run_retrieval(
+                effective_query, root, chat_fn,
+                link_index=link_index, on_event=_on_event, history=history,
+            )
 
         elapsed = time.time() - start
 
@@ -893,6 +1042,100 @@ def chat(
             elapsed_seconds=elapsed,
         )
         write_log(vault / folder, record)
+
+
+@main.command()
+@click.option(
+    "--vault",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Obsidian vault root.",
+)
+@click.option(
+    "--extra-vault",
+    "extra_vaults",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Additional vault paths for multi-vault search.",
+)
+@click.option(
+    "--folder", default=None, help="Subfolder inside the vault.",
+)
+@click.option("--model", default="ollama/gemma4:26b", help="LiteLLM model id.")
+@click.option("--num-ctx", default=131072, type=int, help="Ollama context window.")
+@click.option(
+    "--max-workers", default=4, type=int, help="Parallel LLM workers.",
+)
+@click.option("--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1")
+@click.option("--port", default=8000, type=int, help="Bind port. Default: 8000")
+def serve(
+    vault: Path | None,
+    extra_vaults: tuple[Path, ...],
+    folder: str | None,
+    model: str,
+    num_ctx: int,
+    max_workers: int,
+    host: str,
+    port: int,
+) -> None:
+    """Run pagewiki as an HTTP API server (v0.7).
+
+    Scans the vault once at startup, keeps the tree warm in memory,
+    and exposes /health, /scan, /ask, /chat endpoints. Chat sessions
+    maintain conversation history server-side.
+
+    Requires the optional ``server`` extra:
+        pip install 'pagewiki[server]'
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        console.print(
+            "[red]uvicorn is not installed.[/]\n"
+            "Install the server extra:\n"
+            "    pip install 'pagewiki[server]'"
+        )
+        sys.exit(1)
+
+    from .server import build_initial_state, create_app
+
+    # Resolve primary + extra vaults.
+    primary = _resolve_vault(vault)
+    all_vaults: list[Path] = [primary]
+    for extra in extra_vaults:
+        try:
+            abs_extra = extra.expanduser().resolve()
+        except OSError:
+            abs_extra = extra
+        if abs_extra not in [v.resolve() for v in all_vaults]:
+            all_vaults.append(extra)
+
+    console.print(f"[bold cyan]Starting pagewiki server[/] on http://{host}:{port}")
+    console.print(
+        f"  vaults={len(all_vaults)}  folder={folder}  model={model}"
+    )
+    console.print("[dim]Warming up: scanning + summarizing...[/]")
+
+    chat_fn = _make_chat_fn(model, num_ctx)
+
+    try:
+        state = build_initial_state(
+            all_vaults,
+            folder=folder,
+            model=model,
+            num_ctx=num_ctx,
+            max_workers=max_workers,
+            chat_fn=chat_fn,
+        )
+    except Exception as e:
+        console.print(f"[red]Failed to build initial state: {e}[/]")
+        sys.exit(1)
+
+    note_count = sum(1 for n in state.root.walk() if n.kind == "note")
+    console.print(f"[dim]Ready! {note_count} notes loaded. Press Ctrl+C to stop.[/]")
+
+    app = create_app(state)
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

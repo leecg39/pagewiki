@@ -22,12 +22,15 @@ from pathlib import Path
 
 from .prompts import (
     NodeSummary,
+    decompose_query_prompt,
     evaluate_prompt,
     final_answer_prompt,
     final_answer_with_history_prompt,
+    parse_decompose_response,
     parse_evaluate_response,
     parse_select_response,
     select_node_prompt,
+    synthesize_multi_answer_prompt,
 )
 from .tree import TreeNode
 from .wiki_links import LinkIndex, build_link_index
@@ -364,4 +367,112 @@ def run_retrieval(
         cited_nodes=cited,
         trace=trace,
         iterations_used=iteration,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-query decomposition (v0.7)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def run_decomposed_retrieval(
+    query: str,
+    root: TreeNode,
+    chat_fn: ChatFn,
+    *,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    max_gathered: int = DEFAULT_MAX_GATHERED_NOTES,
+    link_index: LinkIndex | None = None,
+    on_event: EventCallback = None,
+    max_sub_queries: int = 4,
+) -> RetrievalResult:
+    """Decompose a complex query into sub-queries, retrieve in parallel, synthesize.
+
+    The workflow is:
+
+      1. Ask the LLM to split the query into 1-N sub-questions. If it
+         returns ``SINGLE``, fall through to a normal ``run_retrieval``.
+      2. Run ``run_retrieval`` once per sub-query. They share the
+         same tree and link_index but have independent reasoning traces.
+      3. Synthesize a single final answer from the per-sub-query
+         answers using ``synthesize_multi_answer_prompt``.
+
+    All sub-query cited_nodes are merged (deduplicated) into the result.
+    """
+    # Phase 1: decompose.
+    decomp_prompt = decompose_query_prompt(query, max_sub_queries=max_sub_queries)
+    decomp_response = chat_fn(decomp_prompt)
+    sub_queries = parse_decompose_response(decomp_response)
+
+    if not sub_queries:
+        # Simple query — use the standard single-pass loop.
+        if on_event is not None:
+            on_event(TraceStep("decompose", None, "SINGLE: 단일 쿼리로 처리"))
+        return run_retrieval(
+            query, root, chat_fn,
+            max_iterations=max_iterations,
+            max_gathered=max_gathered,
+            link_index=link_index,
+            on_event=on_event,
+        )
+
+    if on_event is not None:
+        on_event(
+            TraceStep(
+                "decompose",
+                None,
+                f"{len(sub_queries)}개 하위 질문으로 분해: "
+                + " | ".join(sub_queries),
+            )
+        )
+
+    # Phase 2: run retrieval per sub-query (sequential; each hits the
+    # LLM ~5-10 times so parallelizing them would thrash Ollama).
+    sub_results: list[tuple[str, RetrievalResult]] = []
+    merged_trace: list[TraceStep] = []
+    merged_cited: list[str] = []
+
+    for i, sub in enumerate(sub_queries, start=1):
+        if on_event is not None:
+            on_event(
+                TraceStep(
+                    "decompose",
+                    None,
+                    f"[{i}/{len(sub_queries)}] 실행: {sub}",
+                )
+            )
+        sub_result = run_retrieval(
+            sub, root, chat_fn,
+            max_iterations=max_iterations,
+            max_gathered=max_gathered,
+            link_index=link_index,
+            on_event=on_event,
+        )
+        sub_results.append((sub, sub_result))
+        merged_trace.extend(sub_result.trace)
+        for nid in sub_result.cited_nodes:
+            if nid not in merged_cited:
+                merged_cited.append(nid)
+
+    # Phase 3: synthesize.
+    sub_qa_pairs = [(sub_q, sub_r.answer) for sub_q, sub_r in sub_results]
+    synth_prompt = synthesize_multi_answer_prompt(query, sub_qa_pairs)
+    final_answer = chat_fn(synth_prompt).strip()
+
+    merged_trace.append(
+        TraceStep(
+            "decompose",
+            None,
+            f"synthesized {len(sub_results)} sub-answers into final response",
+        )
+    )
+    if on_event is not None:
+        on_event(merged_trace[-1])
+
+    total_iterations = sum(r.iterations_used for _, r in sub_results)
+    return RetrievalResult(
+        answer=final_answer,
+        cited_nodes=merged_cited,
+        trace=merged_trace,
+        iterations_used=total_iterations,
     )

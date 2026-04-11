@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pagewiki"
-version = "0.6.0"
+version = "0.7.0"
 description = "Vectorless reasoning-based RAG for Obsidian vaults, powered by local Gemma 4"
 readme = "README.md"
 license = { text = "MIT" }
@@ -38,6 +38,10 @@ dev = [
   "pytest-cov>=4.1.0",
   "ruff>=0.4.0",
   "mypy>=1.10.0",
+]
+server = [
+  "fastapi>=0.110.0",
+  "uvicorn>=0.27.0",
 ]
 
 [project.scripts]

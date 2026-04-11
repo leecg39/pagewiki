@@ -80,6 +80,21 @@ pagewiki chat --folder Research
 pagewiki ask "attention 메커니즘 비교" --tag research --after 2024-01
 pagewiki chat --tag ml --before 2025-06
 
+# 멀티쿼리 분해 (v0.7+): 복합 질문을 서브쿼리로 분해 후 종합
+pagewiki ask "Transformer와 RNN의 차이점과 장단점은?" --decompose
+
+# 병렬 LLM 호출 (v0.7+): ATOMIC 노트 요약 병렬화
+pagewiki ask "query" --max-workers 8
+
+# 멀티 vault 검색 (v0.7+): 여러 볼트 동시 검색
+pagewiki ask "query" --vault ~/Research --extra-vault ~/Work --extra-vault ~/Personal
+
+# HTTP API 서버 (v0.7+): 트리를 메모리에 warm 유지, 반복 쿼리 가속
+pagewiki serve --vault ~/Research --folder Research --port 8000
+# 이후:
+# curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json' \
+#   -d '{"query": "What is attention?"}'
+
 # LLM-Wiki 컴파일 (v0.3+): entity 추출 → 위키 페이지 자동 생성
 pagewiki compile --folder Research             # → {vault}/LLM-Wiki/
 
@@ -120,8 +135,8 @@ pagewiki ask "query" --vault "~/Documents/Obsidian Vault" --model ollama/gemma4:
 - v0.3: Karpathy LLM-Wiki compiler — `pagewiki compile`로 entity 추출 → 위키 페이지 자동 생성 → `{vault}/LLM-Wiki/`에 교차참조된 위키 출력
 - v0.4: 증분 재인덱싱 + mtime watcher — `pagewiki watch`로 파일 변경 실시간 감지
 - v0.5: Obsidian 플러그인 UI — Command Palette에서 Scan/Ask/Compile 실행, Settings 탭, 결과 모달
-- **v0.6 (현재)**: 대화형 `chat` 모드, atomic summary 디스크 캐시, YAML frontmatter 필터 (`--tag`/`--after`/`--before`), 실시간 스트리밍 출력
-- v0.7 (계획): 병렬 LLM 호출, 멀티쿼리 분해, API 서버 모드, 멀티 vault 지원
+- v0.6: 대화형 `chat` 모드, atomic summary 디스크 캐시, YAML frontmatter 필터 (`--tag`/`--after`/`--before`), 실시간 스트리밍 출력
+- **v0.7 (현재)**: 병렬 LLM 호출 (`--max-workers`), 멀티쿼리 분해 (`--decompose`), 멀티 vault 검색 (`--extra-vault`), HTTP API 서버 (`pagewiki serve`)
 
 ## Obsidian 플러그인 (v0.6)
 
